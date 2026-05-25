@@ -192,3 +192,21 @@ def test_gh_missing_exits_6(fake_gh):
                  stderr=err)
     assert code == 6
     assert "gh" in err.getvalue()
+
+
+# Unexpected exception → exit 1 with clean message =====
+
+
+def test_unexpected_oserror_exits_1_no_traceback(fake_gh):
+    def gh_get(path, *, host=None, paginate=False):
+        raise OSError("disk full")
+
+    err = io.StringIO()
+    code = main(["status", "https://github.com/o/r/pull/1"],
+                 gh_get=gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+                 stderr=err)
+    assert code == int(ExitCode.UNEXPECTED) == 1
+    stderr_value = err.getvalue()
+    assert "unexpected" in stderr_value.lower()
+    assert "disk full" in stderr_value
+    assert "Traceback (most recent call last)" not in stderr_value
