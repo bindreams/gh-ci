@@ -76,10 +76,12 @@ def test_gh_api_get_paginate_merges_multi_page_array(fp):
 def test_gh_api_get_paginate_merges_multi_page_object_with_array(fp):
     # Regression: /repos/<o>/<r>/actions/runs/<id>/jobs returns
     # {"total_count": N, "jobs": [...]}. With --paginate --slurp, gh wraps
-    # each page in a JSON array. We must merge the `jobs` arrays and sum
-    # `total_count` across pages.
+    # each page in a JSON array. We must merge the `jobs` arrays and take
+    # the first page's `total_count` (GitHub reports collection-wide totals
+    # on every page, so "first-page wins" — summing would double-count).
+    # Use disagreeing totals so first-page-wins is distinguishable from sum.
     page1 = '{"total_count": 3, "jobs": [{"id": 1}, {"id": 2}]}'
-    page2 = '{"total_count": 3, "jobs": [{"id": 3}]}'
+    page2 = '{"total_count": 5, "jobs": [{"id": 3}]}'
     fp.register(
         [
             "gh",
@@ -99,6 +101,95 @@ def test_gh_api_get_paginate_merges_multi_page_object_with_array(fp):
     }
 
 
+def test_gh_api_get_paginate_merges_three_pages_object_with_array(fp):
+    # Three-page merge: guards against "merge only last page" / "merge only
+    # adjacent pages" bugs. Each page contributes to `jobs`; first page's
+    # `total_count` wins.
+    page1 = '{"total_count": 6, "jobs": [{"id": 1}]}'
+    page2 = '{"total_count": 6, "jobs": [{"id": 2}, {"id": 3}]}'
+    page3 = '{"total_count": 6, "jobs": [{"id": 4}, {"id": 5}, {"id": 6}]}'
+    fp.register(
+        ["gh", "api", "--paginate", "--slurp", "-X", "GET", "/jobs"],
+        stdout=f"[{page1},{page2},{page3}]",
+    )
+    result = gh_api_get("/jobs", paginate=True)
+    assert result == {
+        "total_count": 6,
+        "jobs": [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}, {"id": 5}, {"id": 6}],
+    }
+
+
+def test_gh_api_get_paginate_first_page_array_key_is_null(fp):
+    # Bug B regression: when the first page has an array-valued key that's
+    # `null` (e.g. `{"jobs": null}`), subsequent pages' arrays must still be
+    # merged. The fix detects array keys across all pages, not just page 0.
+    page1 = '{"total_count": 2, "jobs": null}'
+    page2 = '{"total_count": 2, "jobs": [{"id": 7}, {"id": 8}]}'
+    fp.register(
+        ["gh", "api", "--paginate", "--slurp", "-X", "GET", "/jobs"],
+        stdout=f"[{page1},{page2}]",
+    )
+    result = gh_api_get("/jobs", paginate=True)
+    assert result == {
+        "total_count": 2,
+        "jobs": [{"id": 7}, {"id": 8}],
+    }
+
+
+def test_gh_api_get_paginate_first_page_empty_array_key(fp):
+    # First page has `"jobs": []`, second page has `"jobs": [...]`. Both
+    # pages should be merged; verifies the array-key detection across pages.
+    page1 = '{"total_count": 2, "jobs": []}'
+    page2 = '{"total_count": 2, "jobs": [{"id": 9}, {"id": 10}]}'
+    fp.register(
+        ["gh", "api", "--paginate", "--slurp", "-X", "GET", "/jobs"],
+        stdout=f"[{page1},{page2}]",
+    )
+    result = gh_api_get("/jobs", paginate=True)
+    assert result == {
+        "total_count": 2,
+        "jobs": [{"id": 9}, {"id": 10}],
+    }
+
+
+def test_gh_api_get_paginate_mixed_shape_dict_then_list_raises(fp):
+    # Inconsistent paginated response shape (dict at page 0, list at page 1)
+    # must raise GhError — silently dropping or coercing one page is a bug.
+    page1 = '{"jobs": [{"id": 1}]}'
+    page2 = "[2, 3]"
+    fp.register(
+        ["gh", "api", "--paginate", "--slurp", "-X", "GET", "/jobs"],
+        stdout=f"[{page1},{page2}]",
+    )
+    with pytest.raises(GhError) as exc:
+        gh_api_get("/jobs", paginate=True)
+    assert "inconsistent paginated response shape" in exc.value.stderr
+
+
+def test_gh_api_get_paginate_null_page_raises(fp):
+    # Bug A regression: a JSON `null` page (whether at index 0 or later)
+    # must raise GhError — not be silently returned as-is or merged.
+    fp.register(
+        ["gh", "api", "--paginate", "--slurp", "-X", "GET", "/foo"],
+        stdout="[null]",
+    )
+    with pytest.raises(GhError) as exc:
+        gh_api_get("/foo", paginate=True)
+    assert "inconsistent paginated response shape" in exc.value.stderr
+
+
+def test_gh_api_get_paginate_null_page_at_index_one_raises(fp):
+    # Symmetry with the null-at-index-0 case: null at any index raises.
+    page1 = '{"jobs": [{"id": 1}]}'
+    fp.register(
+        ["gh", "api", "--paginate", "--slurp", "-X", "GET", "/jobs"],
+        stdout=f"[{page1},null]",
+    )
+    with pytest.raises(GhError) as exc:
+        gh_api_get("/jobs", paginate=True)
+    assert "inconsistent paginated response shape" in exc.value.stderr
+
+
 def test_gh_api_get_paginate_single_page_object(fp):
     # Single page returns a one-element list after --slurp; merging should
     # still produce a single object with the same shape.
@@ -115,13 +206,17 @@ def test_gh_api_get_paginate_single_page_object(fp):
 
 
 def test_gh_api_get_paginate_empty(fp):
-    # No results at all: --slurp emits []. Caller should get a sensible empty
-    # value (we choose [] to match the array-endpoint shape).
+    # Bug C regression: no results at all (`--slurp` emits `[]`). The merger
+    # must return a dict-like value so object-endpoint callers doing
+    # `data.get("workflow_runs", [])` don't crash with AttributeError.
     fp.register(
         ["gh", "api", "--paginate", "--slurp", "-X", "GET", "/foo"],
         stdout="[]",
     )
-    assert gh_api_get("/foo", paginate=True) == []
+    result = gh_api_get("/foo", paginate=True)
+    # Must support .get(...) so object-endpoint callers work without checks.
+    assert result.get("workflow_runs", []) == []
+    assert result == {}
 
 
 def test_gh_api_get_raises_GhError_on_non_zero(fp):
