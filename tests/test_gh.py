@@ -268,6 +268,29 @@ def test_gh_api_graphql_with_host(fp):
     assert gh_api_graphql(query, host="ghes.example.com") == {"ok": True}
 
 
+def test_gh_api_graphql_omits_None_variables(fp):
+    # Regression: None-valued variables must NOT be passed as `-F key=`
+    # (which sends the empty string verbatim, ill-defined for nullable
+    # GraphQL variables like `String` cursors). GitHub treats a
+    # declared-but-unprovided variable as null, so omitting the flag is
+    # the correct way to mean "use null / from the start".
+    query = "query($n:Int, $cursor:String){ x(n:$n, after:$cursor) }"
+    fp.register(
+        ["gh", "api", "graphql", "-F", "query=@-", "-F", "n=42"],
+        stdout='{"data":{"x":"ok"}}',
+    )
+    result = gh_api_graphql(query, n=42, cursor=None)
+    assert result == {"x": "ok"}
+    # Inspect the actual args list to assert cursor flag is absent while n is present.
+    call = fp.calls[0]
+    args = list(call)
+    assert "-F" in args
+    # The presence of `n=42` proves non-None variables still go through.
+    assert "n=42" in args
+    # The absence of any `cursor=...` flag proves None was omitted.
+    assert not any(a.startswith("cursor=") for a in args)
+
+
 def test_gh_api_graphql_raises_GhError_when_errors_present(fp):
     fp.register(
         ["gh", "api", "graphql", "-F", "query=@-"],
