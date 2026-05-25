@@ -215,6 +215,46 @@ def test_ignored_failure_does_not_exit_3(fake_gh):
     assert "Failed (ignored by --ignore): flaky" in summary
 
 
+def test_initial_head_sha_falls_back_to_rest_when_graphql_null(fake_gh):
+    # Regression: if the GraphQL rollup returns headRefOid: None on the
+    # initial fetch, the loop must seed state.head_sha from the REST
+    # head.sha (always present for an open PR). Otherwise a subsequent real
+    # tick with the same SHA would either be missed as a force-push or
+    # falsely flagged as one.
+    rest_sha = "restsha1234567"
+    fake_gh.set_get(
+        "/repos/o/r/pulls/1",
+        {
+            "state": "open",
+            "mergeable": True,
+            "mergeable_state": "clean",
+            "head": {"sha": rest_sha},
+        },
+    )
+    fake_gh.queue_graphql(
+        # Initial: GraphQL returns headRefOid: None (and an in-progress job
+        # so we proceed into the loop).
+        _graphql_payload(
+            [_node("build", status="IN_PROGRESS", conclusion=None)],
+            head_sha=None,
+        ),
+        # Tick 1: GraphQL surfaces the real SHA (matches REST). Job completes
+        # green. This must NOT be reported as a force-push, because state
+        # was seeded from REST at init.
+        _graphql_payload(
+            [_node("build", status="COMPLETED", conclusion="SUCCESS")],
+            head_sha=rest_sha,
+        ),
+    )
+    code, summary, stderr, _ = _run_watch_pr(fake_gh, interval=5.0)
+    assert code == 0
+    # The resolution line includes the head SHA prefix when present — this
+    # is the user-observable proof that state.head_sha was seeded from REST.
+    assert rest_sha[:7] in stderr
+    # And no spurious force-push line was emitted on tick 1.
+    assert "Force-push detected" not in stderr
+
+
 def test_force_push_event_emitted(fake_gh):
     fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
     fake_gh.queue_graphql(

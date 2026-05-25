@@ -53,9 +53,12 @@ def update_state(
     On force-push: rebuild state from new_items, reset all timers, emit no events.
     Otherwise: emit Events for transitions and update timers.
     """
+    # Force-push detection: any time we observe a new, real SHA that differs
+    # from what we previously had (including the None we had before we knew
+    # any SHA), treat it as a baseline reset. We require new_head_sha to be
+    # non-None so we don't flag a transient null tick as a force-push.
     force_pushed = (
         new_head_sha is not None
-        and state.head_sha is not None
         and new_head_sha != state.head_sha
     )
     next_state = WatchState(head_sha=new_head_sha if new_head_sha is not None else state.head_sha)

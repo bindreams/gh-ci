@@ -57,9 +57,8 @@ def run_watch(
     err = stderr or sys.stderr
     host = host_for_gh(target)
 
-    pr_number = target.pr_number if isinstance(target, PrTarget) else None
-
     # Pre-loop conflict check.
+    pr_meta: dict | None = None
     if isinstance(target, PrTarget):
         pr_meta = fetch_pr_meta(
             target.owner, target.repo, target.pr_number,
@@ -73,6 +72,16 @@ def run_watch(
     # Initial item fetch + resolution line.
     items, meta = _fetch_items(target, gh_get=gh_get, gh_graphql_fn=gh_graphql_fn, host=host)
     head_sha = meta.get("headRefOid") if meta else None
+    # If the GraphQL rollup didn't surface a head SHA (e.g. the PR has no
+    # commits visible via that query, or a fixture inconsistency), fall back
+    # to the REST head.sha — it's always present for an open PR. Seeding
+    # state.head_sha from REST avoids emitting a spurious force-push event
+    # on the first tick where GraphQL recovers a non-null headRefOid.
+    if head_sha is None and pr_meta is not None:
+        rest_head = pr_meta.get("head") or {}
+        rest_sha = rest_head.get("sha") if isinstance(rest_head, dict) else None
+        if rest_sha:
+            head_sha = rest_sha
     print(_resolution_line(target, head_sha), file=err, flush=True)
 
     state = initial_state(items, head_sha=head_sha)

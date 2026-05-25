@@ -115,6 +115,43 @@ def test_no_force_push_when_head_sha_unchanged():
     assert force_push is False
 
 
+def test_force_push_detected_when_prior_head_sha_was_none():
+    # Regression: if the initial GraphQL fetch returned headRefOid: None,
+    # state.head_sha is None. The first tick that reveals a real SHA must
+    # still be detected as a force-push so timers get reset against the
+    # correct baseline.
+    state = initial_state([_item("a", status="queued")], head_sha=None)
+    new_state, events, force_push = update_state(
+        state, [_item("a", status="queued")], now=10.0, new_head_sha="sha1",
+    )
+    assert force_push is True
+    assert events == []
+    assert new_state.head_sha == "sha1"
+
+
+def test_no_force_push_when_both_head_shas_are_none():
+    # Regression: when we still don't have a SHA at all, we can't claim a
+    # force-push — there's nothing to compare against yet.
+    state = initial_state([_item("a", status="queued")], head_sha=None)
+    new_state, _, force_push = update_state(
+        state, [_item("a", status="queued")], now=10.0, new_head_sha=None,
+    )
+    assert force_push is False
+    assert new_state.head_sha is None
+
+
+def test_transient_null_head_sha_does_not_clobber_known_head_sha():
+    # Regression: a tick where new_head_sha is None (e.g. a flaky/empty
+    # GraphQL response) must not erase the known state.head_sha or be
+    # treated as a force-push.
+    state = initial_state([_item("a", status="queued")], head_sha="sha1")
+    new_state, _, force_push = update_state(
+        state, [_item("a", status="queued")], now=10.0, new_head_sha=None,
+    )
+    assert force_push is False
+    assert new_state.head_sha == "sha1"
+
+
 # Stalled-required timers =====
 
 
