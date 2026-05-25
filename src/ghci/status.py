@@ -2,43 +2,19 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
-from enum import IntEnum
 from typing import Iterable
 
 from ghci.checks import CheckItem, Outcome, classify_conclusion
-from ghci.colors import Palette, _ResultStyle, ensure_palette
+from ghci.colors import (
+    GROUP_STYLE_COLOR,
+    Palette,
+    RESULT_STYLE_COLOR,
+    _GroupStyle,
+    _ResultStyle,
+    ensure_palette,
+)
 from ghci.conflicts import ConflictOutcome, assess_pr, message_for, result_style_for
 from ghci.ignore import IgnoreRule, matches as ignore_matches
-
-
-# Group style key (used by format_summary to colorize labels) =====
-
-
-class _GroupStyle(IntEnum):
-    PASSED = 1
-    FAILED = 2
-    IN_FLIGHT = 3
-    STALLED = 4
-    UNKNOWN = 5
-    NEUTRAL = 6
-
-
-_GROUP_STYLE_COLOR: dict[_GroupStyle, str | None] = {
-    _GroupStyle.PASSED: "green",
-    _GroupStyle.FAILED: "red",
-    _GroupStyle.IN_FLIGHT: "yellow",
-    _GroupStyle.STALLED: "red",
-    _GroupStyle.UNKNOWN: "yellow",
-    _GroupStyle.NEUTRAL: None,  # dim only
-}
-
-
-# Map _ResultStyle -> color name for the colors.py Palette.style API.
-_RESULT_STYLE_COLOR: dict[_ResultStyle, str] = {
-    _ResultStyle.GREEN: "green",
-    _ResultStyle.RED: "red",
-    _ResultStyle.YELLOW: "yellow",
-}
 
 
 # evaluate_snapshot =====
@@ -122,7 +98,7 @@ def _conflict_summary(
     result_line = f"Result: {outcome.value}"
     style = result_style_for(outcome)
     if style is not None:
-        color = _RESULT_STYLE_COLOR[style]
+        color = RESULT_STYLE_COLOR[style]
         result_line = p.style(result_line, color=color, bold=True)
     return f"{result_line}\n{line}"
 
@@ -281,7 +257,7 @@ def _render_result_line(
     if result_style is None:
         return result_line
     first, sep, rest = result_line.partition("\n")
-    color = _RESULT_STYLE_COLOR[result_style]
+    color = RESULT_STYLE_COLOR[result_style]
     colored_first = palette.style(first, color=color, bold=True)
     return colored_first if not sep else f"{colored_first}{sep}{rest}"
 
@@ -290,7 +266,7 @@ def _render_group_label(spec: _GroupSpec, palette: Palette) -> str:
     """Color a group label per its style key. Ignored groups are always dim."""
     if spec.ignored:
         return palette.style(spec.label, dim=True)
-    if spec.style is _GroupStyle.NEUTRAL:
+    if spec.style == _GroupStyle.NEUTRAL:
         return palette.style(spec.label, dim=True)
-    color = _GROUP_STYLE_COLOR[spec.style]
+    color = GROUP_STYLE_COLOR[spec.style]
     return palette.style(spec.label, color=color)

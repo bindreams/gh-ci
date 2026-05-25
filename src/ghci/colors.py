@@ -26,10 +26,35 @@ class _ResultStyle(IntEnum):
     YELLOW = 3
 
 
-_RESULT_COLOR: dict[_ResultStyle, str] = {
+# Result-style → color-name mapping consumed by status.format_summary and
+# watch.loop / status._conflict_summary. Single source of truth.
+RESULT_STYLE_COLOR: dict[_ResultStyle, str] = {
     _ResultStyle.GREEN: "green",
     _ResultStyle.RED: "red",
     _ResultStyle.YELLOW: "yellow",
+}
+
+
+# Group-label style (shared across status summaries and watch event lines) =====
+
+
+class _GroupStyle(IntEnum):
+    PASSED = 1
+    FAILED = 2
+    IN_FLIGHT = 3
+    STALLED = 4
+    UNKNOWN = 5
+    NEUTRAL = 6
+
+
+# _GroupStyle.NEUTRAL is rendered as `dim` (no color), so its entry is None.
+GROUP_STYLE_COLOR: dict[_GroupStyle, str | None] = {
+    _GroupStyle.PASSED: "green",
+    _GroupStyle.FAILED: "red",
+    _GroupStyle.IN_FLIGHT: "yellow",
+    _GroupStyle.STALLED: "red",
+    _GroupStyle.UNKNOWN: "yellow",
+    _GroupStyle.NEUTRAL: None,
 }
 
 
@@ -73,7 +98,7 @@ def decide_color(
 def _isatty(stream: TextIO) -> bool:
     try:
         return bool(stream.isatty())
-    except (AttributeError, ValueError):
+    except (AttributeError, ValueError, OSError):
         return False
 
 
@@ -104,7 +129,15 @@ class Palette:
         bold: bool = False,
         dim: bool = False,
     ) -> str:
+        # Validate the color name eagerly — regardless of whether the
+        # palette is enabled — so typos surface uniformly under all
+        # --color modes (otherwise a misspelled color silently passes
+        # under --color=never and crashes under --color=always).
+        if color is not None and color not in _COLOR_CODE:
+            raise KeyError(color)
         if not self.enabled:
+            return text
+        if not bold and not dim and color is None:
             return text
         codes: list[str] = []
         if bold:
@@ -113,8 +146,6 @@ class Palette:
             codes.append(_DIM)
         if color is not None:
             codes.append(_COLOR_CODE[color])
-        if not codes:
-            return text
         return f"{''.join(codes)}{text}{_RESET}"
 
 
