@@ -10,8 +10,8 @@ from typing import Any, Callable, TextIO
 
 import platformdirs
 
-from ghci.checks import Outcome, classify_conclusion, fetch_pr_meta
-from ghci.gh import GhError, gh_api_download, gh_api_get, parse_http_status
+from ghci.checks import Outcome, classify_conclusion, fetch_pr_checks
+from ghci.gh import GhError, gh_api_download, gh_api_get, gh_api_graphql, parse_http_status
 from ghci.ignore import IgnoreRule
 from ghci.target import (
     EmptyTargetError,
@@ -35,6 +35,7 @@ def run_logs(
     output_dir: Path | None,
     stderr: TextIO | None = None,
     gh_get: Callable[..., Any] = gh_api_get,
+    gh_graphql_fn: Callable[..., dict] = gh_api_graphql,
     gh_download_fn: Callable[..., int] = gh_api_download,
     now: datetime | None = None,
 ) -> int:
@@ -48,7 +49,9 @@ def run_logs(
 
     # Determine list of runs to process.
     try:
-        runs = _resolve_runs_for_target(target, gh_get=gh_get, host=host)
+        runs = _resolve_runs_for_target(
+            target, gh_get=gh_get, gh_graphql_fn=gh_graphql_fn, host=host,
+        )
     except GhError as e:
         print(f"gh error: {e}", file=err)
         return 6
@@ -137,6 +140,7 @@ def _resolve_runs_for_target(
     target: ResolvedTarget,
     *,
     gh_get: Callable[..., Any],
+    gh_graphql_fn: Callable[..., dict],
     host: str | None,
 ) -> list[dict]:
     """Return list of {run_id, jobs, workflow_name, run_url}."""
@@ -201,25 +205,40 @@ def _resolve_runs_for_target(
             "run_url": run.get("html_url") or "",
         }]
     assert isinstance(target, PrTarget)
-    # PR target: list workflow runs on the PR's head SHA.
-    pr = fetch_pr_meta(target.owner, target.repo, target.pr_number,
-                        host=host, gh_get=gh_get)
-    head_sha = (pr.get("head") or {}).get("sha")
-    if not head_sha:
-        return []
-    runs_data = gh_get(
-        f"/repos/{target.owner}/{target.repo}/actions/runs?head_sha={head_sha}",
-        host=host,
-        paginate=True,
+    # PR target: derive workflow run_ids from the PR's check-runs rollup
+    # (GraphQL). This works for fork PRs too — the REST query
+    # /actions/runs?head_sha=<sha> against the BASE repo returns nothing
+    # when the head SHA lives in the fork. The check-runs rollup is keyed
+    # by PR, not repo, so it lists all workflow runs regardless of where
+    # the head ref lives. Once we have the run_ids, REST endpoints on the
+    # base repo (/actions/runs/<id>, /actions/runs/<id>/jobs) do work for
+    # fork-PR runs because those runs are associated with the base repo
+    # via the PR.
+    items, _ = fetch_pr_checks(
+        target.owner, target.repo, target.pr_number,
+        host=host, gh_graphql_fn=gh_graphql_fn,
     )
+    seen: set[int] = set()
+    run_ids: list[int] = []
+    for item in items:
+        if item.kind != "actions" or item.run_id is None:
+            continue
+        if item.run_id in seen:
+            continue
+        seen.add(item.run_id)
+        run_ids.append(item.run_id)
     results = []
-    for run in runs_data.get("workflow_runs", []):
+    for run_id in run_ids:
+        run = gh_get(
+            f"/repos/{target.owner}/{target.repo}/actions/runs/{run_id}",
+            host=host,
+        )
         jobs_data = gh_get(
-            f"/repos/{target.owner}/{target.repo}/actions/runs/{run['id']}/jobs",
+            f"/repos/{target.owner}/{target.repo}/actions/runs/{run_id}/jobs",
             host=host, paginate=True,
         )
         results.append({
-            "run_id": run["id"],
+            "run_id": run_id,
             "jobs": jobs_data.get("jobs", []),
             "workflow_name": run.get("name"),
             "run_url": run.get("html_url") or "",

@@ -429,6 +429,115 @@ def test_filename_sanitization(fake_gh, tmp_path):
     assert any(name.startswith("1-test") and name.endswith(".log") for name in files)
 
 
+# PR target (fork PR) =====
+
+
+def test_fork_pr_target_uses_check_runs_rollup(fake_gh, tmp_path):
+    """Regression: for a fork PR, /actions/runs?head_sha=<sha> against the
+    base repo returns zero workflow runs (the head SHA lives in the fork,
+    not the base repo). We must derive run_ids from the PR's check-runs
+    rollup (GraphQL) instead, which is keyed by PR and works for forks.
+    Once we have a run_id, REST endpoints on the base repo do work, because
+    workflow runs for a PR are associated with the base repo."""
+    # GraphQL rollup with one Actions CheckRun pointing to run 999.
+    fake_gh.queue_graphql({
+        "repository": {
+            "pullRequest": {
+                "state": "OPEN",
+                "mergeable": "MERGEABLE",
+                "headRefOid": "forksha",
+                "commits": {
+                    "nodes": [{
+                        "commit": {
+                            "statusCheckRollup": {
+                                "contexts": {
+                                    "pageInfo": {
+                                        "hasNextPage": False,
+                                        "endCursor": None,
+                                    },
+                                    "nodes": [{
+                                        "__typename": "CheckRun",
+                                        "name": "build",
+                                        "status": "COMPLETED",
+                                        "conclusion": "SUCCESS",
+                                        "detailsUrl": (
+                                            "https://github.com/o/r/runs/1"
+                                        ),
+                                        "isRequired": False,
+                                        "databaseId": 1,
+                                        "checkSuite": {
+                                            "workflowRun": {
+                                                "databaseId": 999,
+                                                "url": (
+                                                    "https://github.com/"
+                                                    "o/r/actions/runs/999"
+                                                ),
+                                                "workflow": {"name": "CI"},
+                                            },
+                                        },
+                                    }],
+                                },
+                            },
+                        },
+                    }],
+                },
+            },
+        },
+    })
+    # REST run metadata + jobs on the BASE repo for run 999. These DO work
+    # for fork-PR runs because the workflow run is associated with the base
+    # repo via the PR.
+    fake_gh.set_get(
+        "/repos/o/r/actions/runs/999",
+        {"id": 999, "name": "CI", "status": "completed",
+         "html_url": "https://github.com/o/r/actions/runs/999"},
+    )
+    fake_gh.set_get(
+        "/repos/o/r/actions/runs/999/jobs",
+        {"jobs": [
+            {"id": 77, "name": "build", "status": "completed",
+             "conclusion": "success", "started_at": "S",
+             "completed_at": "E", "html_url": "u", "run_id": 999},
+        ]},
+    )
+
+    dl = FakeDownload()
+    dl.set_ok("/repos/o/r/actions/jobs/77/logs", b"build log content")
+
+    # Wrap gh_get so the old (buggy) REST query path would loudly fail if
+    # invoked — the new code must not call /actions/runs?head_sha=...
+    def gh_get_guard(path, *, host=None, paginate=False):
+        if path.startswith("/repos/o/r/actions/runs?head_sha="):
+            raise AssertionError(
+                "old buggy path used: /actions/runs?head_sha=... — must "
+                "use check-runs rollup for fork PRs"
+            )
+        return fake_gh.gh_get(path, host=host, paginate=paginate)
+
+    code = run_logs(
+        target=PrTarget(owner="o", repo="r", host="github.com", pr_number=42),
+        failed_only=False,
+        ignore_rules=[],
+        output_dir=tmp_path,
+        stderr=io.StringIO(),
+        gh_get=gh_get_guard,
+        gh_graphql_fn=fake_gh.gh_graphql,
+        gh_download_fn=dl,
+        now=NOW,
+    )
+    assert code == 0
+    subdirs = list(tmp_path.iterdir())
+    assert len(subdirs) == 1
+    subdir = subdirs[0]
+    assert subdir.name == "gh-ci-999-2026-05-25T14-30-00Z"
+    files = {p.name for p in subdir.iterdir()}
+    assert "77-build.log" in files
+    assert (subdir / "77-build.log").read_bytes() == b"build log content"
+    manifest = json.loads((subdir / "manifest.json").read_text())
+    assert manifest["run_id"] == 999
+    assert manifest["target_kind"] == "pr"
+
+
 # Output dir mkdir =====
 
 
