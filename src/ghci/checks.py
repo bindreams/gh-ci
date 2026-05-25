@@ -117,7 +117,7 @@ def fetch_pr_checks(
             owner=owner,
             repo=repo,
             number=pr_number,
-            cursor=cursor or "",
+            cursor=cursor,
         )
         pr = data["repository"]["pullRequest"]
         if not meta:

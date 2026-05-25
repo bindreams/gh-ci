@@ -176,6 +176,14 @@ def gh_api_graphql(
 ) -> dict:
     sub: list[str] = ["graphql", "-F", "query=@-"]
     for k, v in variables.items():
+        # Skip None values so callers can pass `key=None` to mean "omit the
+        # variable". GraphQL treats a declared-but-unprovided nullable
+        # variable as null, which is the correct semantics for e.g. first-
+        # page pagination (`after:null` == "from the start"). Passing
+        # `-F key=` would send the empty string verbatim, which is
+        # ill-defined for `String` cursors.
+        if v is None:
+            continue
         sub += ["-F", f"{k}={v}"]
     args = _api_args(host, sub)
     proc = subprocess.run(args, input=query, capture_output=True, text=True)

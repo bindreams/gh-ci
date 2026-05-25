@@ -178,6 +178,22 @@ def test_fetch_pr_checks_status_context_failure():
     assert items[0].conclusion == "failure"
 
 
+def test_fetch_pr_checks_first_page_sends_cursor_as_null():
+    # Regression: the first page must NOT pass `cursor=""` — GraphQL's
+    # `String` is nullable and `after:""` is ill-defined. Correct semantics
+    # is to either omit the variable (GitHub treats it as null) or pass
+    # explicit None. Either is acceptable here; passing `""` is not.
+    fn = _gh_graphql_returning(
+        _graphql_payload([_checkrun_actions_node(name="lint")])
+    )
+    fetch_pr_checks("foo", "bar", 1, gh_graphql_fn=fn)
+    assert len(fn.calls) >= 1
+    first_vars = fn.calls[0]["variables"]
+    # `cursor` must be absent OR explicitly None — never the empty string.
+    assert first_vars.get("cursor", None) is None
+    assert first_vars.get("cursor") != ""
+
+
 def test_fetch_pr_checks_paginates():
     fn = _gh_graphql_returning(
         _graphql_payload(
