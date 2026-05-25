@@ -82,7 +82,7 @@ def run_watch(
         rest_sha = rest_head.get("sha") if isinstance(rest_head, dict) else None
         if rest_sha:
             head_sha = rest_sha
-    print(_resolution_line(target, head_sha), file=err, flush=True)
+    print(_resolution_line(target, head_sha, items, ignore_rules), file=err, flush=True)
 
     state = initial_state(items, head_sha=head_sha)
 
@@ -153,8 +153,23 @@ def _conflict_summary(outcome: ConflictOutcome, pr_number: int) -> str:
     return f"Result: {outcome.value}\n{message_for(outcome, pr_number=pr_number)}"
 
 
-def _resolution_line(target: ResolvedTarget, head_sha: str | None) -> str:
+def _resolution_line(
+    target: ResolvedTarget,
+    head_sha: str | None,
+    items: list[CheckItem] | None = None,
+    ignore_rules: list[IgnoreRule] | None = None,
+) -> str:
     if isinstance(target, PrTarget):
+        # Prefer the plan-spec format: include a workflow run id and its
+        # status if any non-ignored Actions checks have been surfaced.
+        run_info = _first_actions_run_info(items or [], ignore_rules or [])
+        if run_info is not None:
+            run_id, status_text = run_info
+            return (
+                f"Watching run {run_id} ({status_text}) on PR #{target.pr_number} "
+                f"in {target.owner}/{target.repo}"
+            )
+        # Fallback: no Actions runs surfaced yet — show PR + head SHA.
         sha = f" (head {head_sha[:7]})" if head_sha else ""
         return f"Watching PR #{target.pr_number} in {target.owner}/{target.repo}{sha}"
     if isinstance(target, RunTarget):
@@ -169,6 +184,76 @@ def _resolution_line(target: ResolvedTarget, head_sha: str | None) -> str:
         f"Watching workflow {target.workflow_path} on branch {target.branch} "
         f"in {target.owner}/{target.repo}"
     )
+
+
+def _first_actions_run_info(
+    items: list[CheckItem], ignore_rules: list[IgnoreRule]
+) -> tuple[int, str] | None:
+    """Return (run_id, human-status) for the first non-ignored Actions run, or None.
+
+    Used to compose the PR-target resolution line per plan §watch step 1.
+
+    The status is aggregated across *all* non-ignored Actions items that share
+    the chosen run_id, so a multi-job run with mixed statuses correctly
+    reports as still in progress rather than picking off the first item's
+    status (which is GraphQL-order-dependent and may be misleading).
+    """
+    chosen_run_id: int | None = None
+    for it in items:
+        if it.kind != "actions" or it.run_id is None:
+            continue
+        if ignore_matches(it, ignore_rules):
+            continue
+        chosen_run_id = it.run_id
+        break
+    if chosen_run_id is None:
+        return None
+
+    statuses = [
+        (it.status or "").lower()
+        for it in items
+        if it.kind == "actions"
+        and it.run_id == chosen_run_id
+        and not ignore_matches(it, ignore_rules)
+    ]
+    return chosen_run_id, _aggregate_run_status(statuses)
+
+
+# Order of preference when aggregating per-job statuses up to a "run-level"
+# status. More-active states win over less-active ones so a single
+# in-progress job dominates a run that's otherwise queued or completed.
+_STATUS_PRIORITY = (
+    "in_progress",
+    "queued",
+    "waiting",
+    "requested",
+    "pending",
+    "expected",
+    "completed",
+)
+
+
+def _aggregate_run_status(statuses: list[str]) -> str:
+    """Pick the most-active status from a per-job status list and humanize it."""
+    if not statuses:
+        return "unknown"
+    chosen = next(
+        (s for s in _STATUS_PRIORITY if s in statuses),
+        # Fall back to whatever the items reported if none match the known set.
+        statuses[0],
+    )
+    return _humanize_status(chosen)
+
+
+def _humanize_status(status: str) -> str:
+    """Translate a status string to a short, human phrase.
+
+    Per the plan example ("Watching run 1234567 (in progress) ..."), the
+    parenthesized value is the workflow run's *status* (queued / in_progress
+    / completed), not its terminal conclusion. Underscores → spaces.
+    """
+    s = (status or "").lower()
+    return s.replace("_", " ") if s else "unknown"
 
 
 def _fetch_items(
@@ -235,7 +320,12 @@ def _evaluate_exit(
             f'To continue watching despite this failure: '
             f'gh-ci watch <target> --ignore job:"{first.name}"'
         )
-        return 3, format_summary(items, ignored, result_line=result_line)
+        # S5: surface still-in-flight non-ignored jobs when bailing on red so
+        # the agent knows what was running when we exited.
+        return 3, format_summary(
+            items, ignored, result_line=result_line,
+            in_flight_label="In progress",
+        )
 
     # 2. Stalled.
     if stalled_timeout is not None:
@@ -244,13 +334,17 @@ def _evaluate_exit(
             ignore_rules=ignore_rules,
         )
         if stalled:
-            names = [it.name for it in stalled]
+            # S2: use the plan's exact wording — quote the name and end with
+            # a period — and split it onto its own line.
             result_line = (
-                f'Result: required check stalled ({names[0]} has not reported '
-                f'in {stalled_timeout:.0f}s — likely misconfigured)'
+                f'Result: required check stalled\n'
+                f'Required check "{stalled[0].name}" has not reported in '
+                f'{stalled_timeout:.0f}s — likely misconfigured.'
             )
+            # S5: include still-in-flight non-ignored jobs.
             return 5, format_summary(
-                items, ignored, result_line=result_line, stalled_names=names,
+                items, ignored, result_line=result_line,
+                stalled_items=stalled, in_flight_label="In progress",
             )
 
     # 3. All done?

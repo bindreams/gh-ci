@@ -48,7 +48,7 @@ def message_for(outcome: ConflictOutcome, *, pr_number: int) -> str:
                 f'"needs update" gate. Update the branch.'
             )
         case ConflictOutcome.UNKNOWN:
-            return (
-                f"PR #{pr_number} mergeability is still computing; "
-                f"retry with watch."
-            )
+            # Plan §status step 4 specifies this exact wording (no PR-#
+            # prefix). The caller is responsible for printing any target
+            # context (resolution line, etc.) if needed.
+            return "Mergeability still computing; retry with watch."
