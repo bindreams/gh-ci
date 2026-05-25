@@ -75,3 +75,63 @@ def test_force_push_line():
 def test_resolution_line_run_in_pr():
     line = format_resolution_line("Watching run 1234567 (in progress) on PR #123 in owner/repo")
     assert line == "Watching run 1234567 (in progress) on PR #123 in owner/repo"
+
+
+# Color-aware tests =====
+
+from ghci.colors import Palette
+from ghci.watch.output import _CONCLUSION_STYLE, _CONCLUSION_WORDS
+
+
+def test_conclusion_words_and_style_have_same_keys():
+    # Source-of-truth parity: the two dicts must not drift.
+    assert set(_CONCLUSION_WORDS) == set(_CONCLUSION_STYLE)
+
+
+def test_concluded_failed_colors_word_red():
+    evt = Event(kind="concluded", name="Build", item=_item("Build", "failure"), conclusion="failure")
+    line = format_event_line(evt, when=WHEN, palette=Palette(True))
+    assert "\033[31mfailed\033[0m" in line
+
+
+def test_concluded_success_colors_word_green():
+    evt = Event(kind="concluded", name="Lint", item=_item("Lint", "success"), conclusion="success")
+    line = format_event_line(evt, when=WHEN, palette=Palette(True))
+    assert "\033[32mgreen\033[0m" in line
+
+
+def test_concluded_skipped_dims_word():
+    evt = Event(kind="concluded", name="S", item=_item("S", "skipped"), conclusion="skipped")
+    line = format_event_line(evt, when=WHEN, palette=Palette(True))
+    assert "\033[2mskipped\033[0m" in line
+
+
+def test_started_event_uncolored_word_even_with_palette():
+    evt = Event(kind="started", name="Build", item=_item("Build"))
+    line = format_event_line(evt, when=WHEN, palette=Palette(True))
+    # The word "started" itself has no ANSI wrapping.
+    assert "started\033[" not in line
+    assert line.endswith('Job "Build" started')
+
+
+def test_timestamp_dimmed_when_palette_enabled():
+    evt = Event(kind="started", name="Build", item=_item("Build"))
+    line = format_event_line(evt, when=WHEN, palette=Palette(True))
+    assert line.startswith("\033[2m13:55:02\033[0m")
+
+
+def test_force_push_line_phrase_yellow():
+    line = format_force_push_line(when=WHEN, new_sha="abc1234deadbeef", palette=Palette(True))
+    assert "\033[33mForce-push detected\033[0m" in line
+
+
+def test_event_line_byte_identical_when_palette_disabled():
+    evt = Event(kind="concluded", name="Build", item=_item("Build", "failure"), conclusion="failure")
+    assert format_event_line(evt, when=WHEN) == '13:55:02  Job "Build" failed'
+    assert format_event_line(evt, when=WHEN, palette=Palette(False)) == '13:55:02  Job "Build" failed'
+
+
+def test_force_push_line_byte_identical_when_palette_disabled():
+    expected = "13:55:02  Force-push detected — now watching SHA abc1234"
+    assert format_force_push_line(when=WHEN, new_sha="abc1234deadbeef") == expected
+    assert format_force_push_line(when=WHEN, new_sha="abc1234deadbeef", palette=Palette(False)) == expected

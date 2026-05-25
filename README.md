@@ -100,6 +100,32 @@ uv run python scripts/capture_fixture.py <fixture-name> -- gh api ...
 - `clock.py` provides a `Clock` protocol. All time-dependent code uses an injected clock; tests use `FakeClock`. No real `time.sleep` in tests.
 - Every `gh api` call passes `-X GET` (or the appropriate method) explicitly.
 
+## Color
+
+`gh-ci` emits ANSI color on result lines, group labels, watch events, and errors. The `--color` flag must appear **before** the subcommand:
+
+```sh
+gh-ci --color=always status <url>
+```
+
+### Decision tree
+
+1. `--color=always` → enable
+2. `--color=never` → disable
+3. `--color=auto` → use color iff stderr is a TTY (env vars deliberately bypassed)
+4. else `NO_COLOR` set and non-empty → disable
+5. else `FORCE_COLOR` set and non-empty → enable
+6. else stderr is a TTY → enable
+7. else → disable
+
+`NO_COLOR` and `FORCE_COLOR` follow the [no-color.org](https://no-color.org/) and [force-color.org](https://force-color.org/) specs: **any non-empty value** enables/disables, including the literal string `"0"`. This matches Rich behavior; only Node/chalk has the special `FORCE_COLOR=0`-disables carve-out, which gh-ci intentionally does not follow.
+
+### Pipeline caveat
+
+The TTY check inspects **stderr**. When stderr is a TTY and stdout is piped (`gh-ci status <url> | grep Result:`), the stdout summary still carries ANSI codes under `auto`/default. In scripts that parse stdout, pass `--color=never` or set `NO_COLOR=1`.
+
+Argparse-generated errors (unknown subcommand, `--help`) are not colored — they fire before the palette is built.
+
 ## Known limitations (v1)
 
 - Required-check stalled detection only catches checks that GitHub lists in the rollup (including `state == "expected"`). Required checks that GitHub never lists at all are invisible.

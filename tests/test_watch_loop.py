@@ -463,3 +463,63 @@ def test_run_target_does_not_call_pr_meta(fake_gh):
     assert "Passed: lint" in summary
     # No /pulls/ call.
     assert not any("/pulls/" in c["path"] for c in fake_gh.get_calls)
+
+
+# Color-aware tests =====
+
+
+from ghci.colors import Palette
+
+
+def _run_watch_pr_colored(fake_gh, palette, *, interval=10.0, timeout=0.0,
+                          stalled_timeout=60.0, ignore_rules=None, clock=None):
+    clock = clock or FakeClock()
+    stderr = io.StringIO()
+    code, summary = run_watch(
+        target=PrTarget(owner="o", repo="r", host="github.com", pr_number=1),
+        ignore_rules=ignore_rules or [],
+        interval=interval,
+        timeout=timeout,
+        stalled_timeout=stalled_timeout,
+        clock=clock,
+        stderr=stderr,
+        gh_get=fake_gh.gh_get,
+        gh_graphql_fn=fake_gh.gh_graphql,
+        palette=palette,
+    )
+    return code, summary, stderr.getvalue(), clock
+
+
+def test_watch_summary_green_colored_when_palette_enabled(fake_gh):
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    fake_gh.queue_graphql(_graphql_payload([_node("lint", conclusion="SUCCESS")]))
+    code, summary, _, _ = _run_watch_pr_colored(fake_gh, Palette(True))
+    assert code == 0
+    first_line = summary.splitlines()[0]
+    assert "\033[1m\033[32m" in first_line
+    assert "Result: green" in first_line
+
+
+def test_watch_summary_red_colored_only_first_line_when_palette_enabled(fake_gh):
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    fake_gh.queue_graphql(_graphql_payload([
+        _node("ok", conclusion="SUCCESS", db_id=1),
+        _node("bad", conclusion="FAILURE", db_id=2),
+    ]))
+    code, summary, _, _ = _run_watch_pr_colored(fake_gh, Palette(True))
+    assert code == 3
+    lines = summary.splitlines()
+    # First line colored red+bold.
+    assert "\033[1m\033[31m" in lines[0]
+    # Advice line plain.
+    assert lines[1].startswith("To continue watching")
+    assert "\033[" not in lines[1]
+
+
+def test_watch_resolution_line_dimmed_when_palette_enabled(fake_gh):
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    fake_gh.queue_graphql(_graphql_payload([_node("lint", conclusion="SUCCESS")]))
+    code, summary, stderr_output, _ = _run_watch_pr_colored(fake_gh, Palette(True))
+    # The resolution line is printed to stderr and dimmed.
+    assert "\033[2m" in stderr_output
+    assert "Watching" in stderr_output

@@ -665,3 +665,121 @@ def test_output_dir_mkdir_p(fake_gh, tmp_path):
     assert code == 0
     assert target_dir.exists()
     assert next(target_dir.iterdir()).is_dir()
+
+
+# Color-aware tests =====
+
+from ghci.colors import Palette
+
+
+def _run_log_job(job_id: int, status="completed", conclusion="success") -> dict:
+    return {
+        "id": job_id, "name": f"J{job_id}", "status": status,
+        "conclusion": conclusion, "started_at": "S", "completed_at": "E",
+        "html_url": "u", "run_id": 1000,
+    }
+
+
+def test_logs_summary_green_when_logs_written_no_errors(fake_gh, tmp_path):
+    fake_gh.set_get("/repos/o/r/actions/runs/1000",
+                    {"id": 1000, "name": "CI", "status": "completed"})
+    fake_gh.set_get("/repos/o/r/actions/runs/1000/jobs",
+                    {"jobs": [_run_log_job(1)]})
+    dl = FakeDownload()
+    dl.set_ok("/repos/o/r/actions/jobs/1/logs", b"log")
+    err = io.StringIO()
+    code = run_logs(
+        target=RunTarget(owner="o", repo="r", host="github.com", run_id=1000),
+        failed_only=False, ignore_rules=[],
+        output_dir=tmp_path, stderr=err,
+        gh_get=fake_gh.gh_get, gh_download_fn=dl, now=NOW,
+        palette=Palette(True),
+    )
+    assert code == 0
+    out = err.getvalue()
+    assert "\033[32mWrote 1 logs\033[0m (" in out
+
+
+def test_logs_summary_yellow_when_zero_logs_written(fake_gh, tmp_path):
+    fake_gh.set_get("/repos/o/r/actions/runs/1000",
+                    {"id": 1000, "name": "CI", "status": "completed"})
+    fake_gh.set_get("/repos/o/r/actions/runs/1000/jobs", {"jobs": []})
+    dl = FakeDownload()
+    err = io.StringIO()
+    code = run_logs(
+        target=RunTarget(owner="o", repo="r", host="github.com", run_id=1000),
+        failed_only=False, ignore_rules=[],
+        output_dir=tmp_path, stderr=err,
+        gh_get=fake_gh.gh_get, gh_download_fn=dl, now=NOW,
+        palette=Palette(True),
+    )
+    assert code == 0
+    out = err.getvalue()
+    assert "\033[33mWrote 0 logs\033[0m (" in out
+
+
+def test_logs_summary_red_when_gh_error(fake_gh, tmp_path):
+    fake_gh.set_get("/repos/o/r/actions/runs/1000",
+                    {"id": 1000, "name": "CI", "status": "completed"})
+    fake_gh.set_get("/repos/o/r/actions/runs/1000/jobs",
+                    {"jobs": [_run_log_job(1)]})
+    dl = FakeDownload()
+    dl.set_error("/repos/o/r/actions/jobs/1/logs", returncode=1, stderr="boom")
+    err = io.StringIO()
+    code = run_logs(
+        target=RunTarget(owner="o", repo="r", host="github.com", run_id=1000),
+        failed_only=False, ignore_rules=[],
+        output_dir=tmp_path, stderr=err,
+        gh_get=fake_gh.gh_get, gh_download_fn=dl, now=NOW,
+        palette=Palette(True),
+    )
+    assert code == 6
+    out = err.getvalue()
+    assert "\033[31mWrote " in out
+
+
+def test_logs_summary_byte_identical_when_palette_disabled(fake_gh, tmp_path):
+    """Regression guard for the exact 'Wrote N logs (...)' string."""
+    fake_gh.set_get("/repos/o/r/actions/runs/1000",
+                    {"id": 1000, "name": "CI", "status": "completed"})
+    fake_gh.set_get("/repos/o/r/actions/runs/1000/jobs",
+                    {"jobs": [_run_log_job(1)]})
+    dl = FakeDownload()
+    dl.set_ok("/repos/o/r/actions/jobs/1/logs", b"log")
+    err = io.StringIO()
+    run_logs(
+        target=RunTarget(owner="o", repo="r", host="github.com", run_id=1000),
+        failed_only=False, ignore_rules=[],
+        output_dir=tmp_path, stderr=err,
+        gh_get=fake_gh.gh_get, gh_download_fn=dl, now=NOW,
+    )
+    last_line = [l for l in err.getvalue().splitlines() if l.startswith("Wrote ")][0]
+    assert last_line == "Wrote 1 logs (0 partial, 0 truncated, 0 with no logs available)"
+
+
+def test_resolved_target_line_dimmed_when_palette_enabled(fake_gh, tmp_path):
+    fake_gh.set_get("/repos/o/r/actions/runs/1000",
+                    {"id": 1000, "name": "CI", "status": "completed"})
+    fake_gh.set_get("/repos/o/r/actions/runs/1000/jobs",
+                    {"jobs": [_run_log_job(1)]})
+    dl = FakeDownload()
+    dl.set_ok("/repos/o/r/actions/jobs/1/logs", b"log")
+    err = io.StringIO()
+    run_logs(
+        target=RunTarget(owner="o", repo="r", host="github.com", run_id=1000),
+        failed_only=False, ignore_rules=[],
+        output_dir=tmp_path, stderr=err,
+        gh_get=fake_gh.gh_get, gh_download_fn=dl, now=NOW,
+        palette=Palette(True),
+    )
+    assert "\033[2mResolved target to" in err.getvalue()
+
+
+def test_output_dir_error_red_when_palette_enabled(tmp_path):
+    from ghci.logs import _resolve_output_dir
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    err = io.StringIO()
+    result = _resolve_output_dir(blocker / "sub", err=err, palette=Palette(True))
+    assert result is None
+    assert err.getvalue().startswith("\033[31m--output-dir: cannot create")

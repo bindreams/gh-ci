@@ -11,6 +11,7 @@ from typing import Any, Callable, TextIO
 import platformdirs
 
 from ghci.checks import Outcome, classify_conclusion, fetch_pr_checks
+from ghci.colors import Palette, ensure_palette
 from ghci.gh import GhError, gh_api_download, gh_api_get, gh_api_graphql, parse_http_status
 from ghci.ignore import IgnoreRule
 from ghci.target import (
@@ -38,12 +39,14 @@ def run_logs(
     gh_graphql_fn: Callable[..., dict] = gh_api_graphql,
     gh_download_fn: Callable[..., int] = gh_api_download,
     now: datetime | None = None,
+    palette: Palette | None = None,
 ) -> int:
     err = stderr or sys.stderr
+    p = ensure_palette(palette)
     host = host_for_gh(target)
     nowdt = now or datetime.now(timezone.utc)
 
-    out_dir = _resolve_output_dir(output_dir, err=err)
+    out_dir = _resolve_output_dir(output_dir, err=err, palette=p)
     if out_dir is None:
         return 2
 
@@ -53,23 +56,23 @@ def run_logs(
             target, gh_get=gh_get, gh_graphql_fn=gh_graphql_fn, host=host,
         )
     except GhError as e:
-        print(f"gh error: {e}", file=err)
+        print(p.style(f"gh error: {e}", color="red"), file=err)
         return 6
 
     if not runs:
-        print("No matching runs to download logs for.", file=err)
+        print(p.style("No matching runs to download logs for.", color="yellow"), file=err)
         return 0
 
-    # Print resolution line.
+    # Print resolution line (dim).
     total_jobs = sum(len(r["jobs"]) for r in runs)
-    print(
+    resolved = (
         f"Resolved target to "
         f"{'run' if len(runs) == 1 else 'runs'} "
         f"{', '.join(str(r['run_id']) for r in runs)} "
         f"({total_jobs} job{'s' if total_jobs != 1 else ''}) "
-        f"in {target.owner}/{target.repo}",
-        file=err,
+        f"in {target.owner}/{target.repo}"
     )
+    print(p.style(resolved, dim=True), file=err)
 
     any_gh_error = False
     summary_counts = {"written": 0, "partial": 0, "truncated": 0, "skipped": 0}
@@ -121,15 +124,23 @@ def run_logs(
         }
         manifest_path = run_dir / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2))
-        print(f"manifest: {manifest_path.resolve()}", file=err)
+        print(p.style(f"manifest: {manifest_path.resolve()}", dim=True), file=err)
 
-    print(
-        f"Wrote {summary_counts['written']} logs "
+    written = summary_counts["written"]
+    leading = f"Wrote {written} logs"
+    if any_gh_error:
+        leading = p.style(leading, color="red")
+    elif written > 0:
+        leading = p.style(leading, color="green")
+    else:
+        leading = p.style(leading, color="yellow")
+    summary_line = (
+        f"{leading} "
         f"({summary_counts['partial']} partial, "
         f"{summary_counts['truncated']} truncated, "
-        f"{summary_counts['skipped']} with no logs available)",
-        file=err,
+        f"{summary_counts['skipped']} with no logs available)"
     )
+    print(summary_line, file=err)
 
     return 6 if any_gh_error else 0
 
@@ -335,12 +346,21 @@ def _job_matches_ignore(
 # Output-dir resolution =====
 
 
-def _resolve_output_dir(custom: Path | None, *, err: TextIO) -> Path | None:
+def _resolve_output_dir(
+    custom: Path | None,
+    *,
+    err: TextIO,
+    palette: Palette | None = None,
+) -> Path | None:
+    p = ensure_palette(palette)
     if custom is not None:
         try:
             custom.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            print(f"--output-dir: cannot create {custom}: {e}", file=err)
+            print(
+                p.style(f"--output-dir: cannot create {custom}: {e}", color="red"),
+                file=err,
+            )
             return None
         return custom
     default = Path(platformdirs.user_downloads_dir())
@@ -348,7 +368,10 @@ def _resolve_output_dir(custom: Path | None, *, err: TextIO) -> Path | None:
         return default
     fallback = Path(tempfile.gettempdir())
     print(
-        f"Default Downloads dir not available; falling back to {fallback}",
+        p.style(
+            f"Default Downloads dir not available; falling back to {fallback}",
+            color="yellow",
+        ),
         file=err,
     )
     return fallback
