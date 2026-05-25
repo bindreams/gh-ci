@@ -159,6 +159,45 @@ def test_ghes_default_branch_lookup_uses_host():
     assert captured["host"] == "github.example.com"
 
 
+# Mixed-case route segments =====
+
+
+def test_pr_url_mixed_case_route_preserves_owner_repo_case():
+    t = resolve_target("https://github.com/Foo/Bar/Pull/123", gh_get=_fake_gh_get())
+    assert t == PrTarget(owner="Foo", repo="Bar", host="github.com", pr_number=123)
+
+
+def test_run_url_mixed_case_route_preserves_owner_repo_case():
+    t = resolve_target(
+        "https://github.com/Foo/Bar/Actions/Runs/9876", gh_get=_fake_gh_get()
+    )
+    assert t == RunTarget(owner="Foo", repo="Bar", host="github.com", run_id=9876)
+
+
+def test_job_url_mixed_case_route_preserves_owner_repo_case():
+    t = resolve_target(
+        "https://github.com/Foo/Bar/actions/Runs/9876/JOB/42",
+        gh_get=_fake_gh_get(),
+    )
+    assert t == JobTarget(
+        owner="Foo", repo="Bar", host="github.com", run_id=9876, job_id=42
+    )
+
+
+def test_workflow_url_mixed_case_route_preserves_owner_repo_and_filename_case():
+    t = resolve_target(
+        "https://github.com/Foo/Bar/Actions/Workflows/ci.yml",
+        gh_get=_fake_gh_get(default_branch="main"),
+    )
+    assert t == WorkflowTarget(
+        owner="Foo",
+        repo="Bar",
+        host="github.com",
+        workflow_path="ci.yml",
+        branch="main",
+    )
+
+
 # Errors =====
 
 

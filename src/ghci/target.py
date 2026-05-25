@@ -68,17 +68,30 @@ _SUPPORTED_FORMS_MSG = (
 )
 
 
-_PR_RE = re.compile(r"^/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<num>\d+)(?:/.*)?$")
+# NOTE: re.IGNORECASE matches the static route segments (pull, actions, runs,
+# jobs, workflows) case-insensitively, while the (?P<owner>...) and (?P<repo>...)
+# captures still preserve the original case of the matched substring. The
+# workflow filename group also preserves case since `\.ya?ml` only affects the
+# extension match, and GitHub treats workflow filenames case-sensitively in
+# practice -- but accepting mixed-case `.YML` for matching purposes is harmless
+# because the captured string is used as-is.
+_PR_RE = re.compile(
+    r"^/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<num>\d+)(?:/.*)?$",
+    re.IGNORECASE,
+)
 _RUN_RE = re.compile(
     r"^/(?P<owner>[^/]+)/(?P<repo>[^/]+)/actions/runs/(?P<run>\d+)"
-    r"(?:/attempts/\d+)?/?$"
+    r"(?:/attempts/\d+)?/?$",
+    re.IGNORECASE,
 )
 _JOB_RE = re.compile(
     r"^/(?P<owner>[^/]+)/(?P<repo>[^/]+)/actions/runs/(?P<run>\d+)"
-    r"/jobs?/(?P<job>\d+)/?$"
+    r"/jobs?/(?P<job>\d+)/?$",
+    re.IGNORECASE,
 )
 _WORKFLOW_RE = re.compile(
-    r"^/(?P<owner>[^/]+)/(?P<repo>[^/]+)/actions/workflows/(?P<wf>[^/]+\.ya?ml)/?$"
+    r"^/(?P<owner>[^/]+)/(?P<repo>[^/]+)/actions/workflows/(?P<wf>[^/]+\.ya?ml)/?$",
+    re.IGNORECASE,
 )
 
 _BRANCH_IN_QUERY_RE = re.compile(r"branch:([^\s+]+)")
