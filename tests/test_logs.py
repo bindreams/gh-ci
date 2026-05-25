@@ -248,6 +248,53 @@ def test_404_records_no_file(fake_gh, tmp_path):
     assert "404" in manifest["jobs"][0]["error"]
 
 
+# 404 with body bytes → orphan .tmp cleaned up =====
+
+
+def test_404_with_body_cleans_up_tmp(fake_gh, tmp_path):
+    """Regression: a 404 response can still carry a non-empty body (e.g. an
+    HTML error page) which gh_api_download writes to <dest>.tmp before gh
+    exits non-zero. In the 404 branch we record log_file=null, so the .tmp
+    would otherwise be left orphaned in run_dir. Verify it is cleaned up."""
+    fake_gh.set_get(
+        "/repos/o/r/actions/runs/1000",
+        {"id": 1000, "name": "CI", "status": "in_progress"},
+    )
+    fake_gh.set_get(
+        "/repos/o/r/actions/runs/1000/jobs",
+        {"jobs": [
+            {"id": 99, "name": "queued-job", "status": "queued", "conclusion": None,
+             "started_at": None, "completed_at": None, "html_url": "u", "run_id": 1000},
+        ]},
+    )
+    dl = FakeDownload()
+    # 404 with a non-empty error body — FakeDownload will create the .tmp
+    # with 512 bytes (matching gh_api_download's real behavior).
+    dl.set_error("/repos/o/r/actions/jobs/99/logs",
+                 returncode=1, stderr="gh: HTTP 404: Not Found",
+                 bytes_written=512)
+
+    code = run_logs(
+        target=RunTarget(owner="o", repo="r", host="github.com", run_id=1000),
+        failed_only=False, ignore_rules=[], output_dir=tmp_path,
+        stderr=io.StringIO(), gh_get=fake_gh.gh_get, gh_download_fn=dl, now=NOW,
+    )
+    # 404 is expected behavior, not an error
+    assert code == 0
+    subdir = next(tmp_path.iterdir())
+    files = {p.name for p in subdir.iterdir()}
+    # No orphan .tmp file should remain
+    assert not any(name.endswith(".tmp") for name in files), (
+        f"orphan .tmp left behind: {files}"
+    )
+    # Manifest still records the 404 and log_file: null, just like the
+    # zero-body 404 case.
+    manifest = json.loads((subdir / "manifest.json").read_text())
+    j = manifest["jobs"][0]
+    assert j["log_file"] is None
+    assert "404" in j["error"]
+
+
 # Truncated → .tmp left + manifest entry =====
 
 

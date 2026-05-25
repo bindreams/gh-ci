@@ -265,7 +265,16 @@ def _download_one_job(
         status_code = parse_http_status(e.stderr)
         if status_code == 404:
             entry["error"] = f"no logs available yet (HTTP 404)"
-            # Clean up zero-byte tmp if FakeDownload left one
+            # gh_api_download only deletes the .tmp file when bytes_written == 0.
+            # A 404 response may still carry a non-empty error body (e.g. an
+            # HTML page), which gets written to <dest>.tmp before gh exits
+            # non-zero. We treat 404 as "no logs yet" (log_file stays null),
+            # so any leftover .tmp would be an orphan — remove it.
+            if e.tmp_path is not None:
+                try:
+                    e.tmp_path.unlink()
+                except OSError:
+                    pass
             return entry, False
         # Real gh error. Manifest reflects the truncated state.
         if e.tmp_path is not None and e.tmp_path.exists():
