@@ -56,8 +56,72 @@ def test_gh_api_get_omits_hostname_when_host_is_none(fp):
 
 
 def test_gh_api_get_with_paginate(fp):
-    fp.register(["gh", "api", "--paginate", "-X", "GET", "/foo"], stdout="[1,2,3]")
+    fp.register(
+        ["gh", "api", "--paginate", "--slurp", "-X", "GET", "/foo"],
+        stdout="[[1,2,3]]",
+    )
     assert gh_api_get("/foo", paginate=True) == [1, 2, 3]
+
+
+def test_gh_api_get_paginate_merges_multi_page_array(fp):
+    # gh api --paginate --slurp wraps each page in a JSON array.
+    # For an array endpoint (e.g. /issues), pages are arrays themselves.
+    fp.register(
+        ["gh", "api", "--paginate", "--slurp", "-X", "GET", "/issues"],
+        stdout="[[1,2,3],[4,5]]",
+    )
+    assert gh_api_get("/issues", paginate=True) == [1, 2, 3, 4, 5]
+
+
+def test_gh_api_get_paginate_merges_multi_page_object_with_array(fp):
+    # Regression: /repos/<o>/<r>/actions/runs/<id>/jobs returns
+    # {"total_count": N, "jobs": [...]}. With --paginate --slurp, gh wraps
+    # each page in a JSON array. We must merge the `jobs` arrays and sum
+    # `total_count` across pages.
+    page1 = '{"total_count": 3, "jobs": [{"id": 1}, {"id": 2}]}'
+    page2 = '{"total_count": 3, "jobs": [{"id": 3}]}'
+    fp.register(
+        [
+            "gh",
+            "api",
+            "--paginate",
+            "--slurp",
+            "-X",
+            "GET",
+            "/repos/o/r/actions/runs/1/jobs",
+        ],
+        stdout=f"[{page1},{page2}]",
+    )
+    result = gh_api_get("/repos/o/r/actions/runs/1/jobs", paginate=True)
+    assert result == {
+        "total_count": 3,
+        "jobs": [{"id": 1}, {"id": 2}, {"id": 3}],
+    }
+
+
+def test_gh_api_get_paginate_single_page_object(fp):
+    # Single page returns a one-element list after --slurp; merging should
+    # still produce a single object with the same shape.
+    page = '{"total_count": 2, "jobs": [{"id": 11}, {"id": 12}]}'
+    fp.register(
+        ["gh", "api", "--paginate", "--slurp", "-X", "GET", "/jobs"],
+        stdout=f"[{page}]",
+    )
+    result = gh_api_get("/jobs", paginate=True)
+    assert result == {
+        "total_count": 2,
+        "jobs": [{"id": 11}, {"id": 12}],
+    }
+
+
+def test_gh_api_get_paginate_empty(fp):
+    # No results at all: --slurp emits []. Caller should get a sensible empty
+    # value (we choose [] to match the array-endpoint shape).
+    fp.register(
+        ["gh", "api", "--paginate", "--slurp", "-X", "GET", "/foo"],
+        stdout="[]",
+    )
+    assert gh_api_get("/foo", paginate=True) == []
 
 
 def test_gh_api_get_raises_GhError_on_non_zero(fp):

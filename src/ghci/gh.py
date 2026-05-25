@@ -44,18 +44,100 @@ def gh_api_get(
 ) -> Any:
     sub: list[str] = []
     if paginate:
-        sub.append("--paginate")
+        # `gh api --paginate` concatenates per-page JSON without wrapping it,
+        # which produces invalid JSON for object-returning endpoints (e.g.
+        # `/repos/<o>/<r>/actions/runs/<id>/jobs` returns
+        # `{"total_count": N, "jobs": [...]}`). Adding `--slurp` makes gh
+        # wrap each page in a JSON array, which we then merge below.
+        sub += ["--paginate", "--slurp"]
     sub += ["-X", "GET", path]
     args = _api_args(host, sub)
     proc = subprocess.run(args, capture_output=True, text=True)
     if proc.returncode != 0:
         raise GhError(returncode=proc.returncode, stderr=proc.stderr)
     try:
-        return json.loads(proc.stdout)
+        data = json.loads(proc.stdout)
     except json.JSONDecodeError as e:
         raise GhError(
             returncode=0, stderr=f"invalid JSON from gh: {e}: {proc.stdout[:200]}"
         ) from e
+    if paginate:
+        return _merge_paginated_pages(data)
+    return data
+
+
+def _merge_paginated_pages(pages: Any) -> Any:
+    """Merge the list of per-page payloads emitted by `gh api --paginate --slurp`.
+
+    Cases handled:
+    - Empty list: return [] (no results at all).
+    - Pages are arrays (e.g. `/issues`): concatenate them.
+    - Pages are objects (e.g. `{"total_count": N, "jobs": [...]}`):
+      concatenate array-valued fields across pages; non-array fields are
+      taken from the first page (GitHub reports collection-wide values like
+      `total_count` on every page, so summing would double-count).
+    - Single page: return it as-is (preserves shape for callers that don't
+      need merging).
+    """
+    if not isinstance(pages, list):
+        # gh should always emit a JSON array under --slurp; if it didn't,
+        # surface the value untouched so callers can decide what to do.
+        return pages
+    if not pages:
+        return []
+    if len(pages) == 1:
+        return pages[0]
+    first = pages[0]
+    if isinstance(first, list):
+        merged_list: list[Any] = []
+        for page in pages:
+            if not isinstance(page, list):
+                raise GhError(
+                    returncode=0,
+                    stderr=(
+                        "inconsistent paginated response shape from gh: "
+                        f"expected list, got {type(page).__name__}"
+                    ),
+                )
+            merged_list.extend(page)
+        return merged_list
+    if isinstance(first, dict):
+        # Identify the array-valued keys (e.g. "jobs", "workflow_runs",
+        # "artifacts", "check_runs"). We merge those by concatenation.
+        # Non-array keys (e.g. "total_count") are taken from the first page;
+        # GitHub reports the collection-wide total on every page, so summing
+        # would double-count.
+        array_keys = [k for k, v in first.items() if isinstance(v, list)]
+        merged: dict[str, Any] = {}
+        for k, v in first.items():
+            if k in array_keys:
+                merged[k] = []
+            else:
+                merged[k] = v
+        for page in pages:
+            if not isinstance(page, dict):
+                raise GhError(
+                    returncode=0,
+                    stderr=(
+                        "inconsistent paginated response shape from gh: "
+                        f"expected dict, got {type(page).__name__}"
+                    ),
+                )
+            for k in array_keys:
+                page_val = page.get(k, [])
+                if not isinstance(page_val, list):
+                    raise GhError(
+                        returncode=0,
+                        stderr=(
+                            f"inconsistent paginated response shape from gh: "
+                            f"key {k!r} expected list, got "
+                            f"{type(page_val).__name__}"
+                        ),
+                    )
+                merged[k].extend(page_val)
+        return merged
+    # Scalar pages (unlikely from GitHub APIs): return the list as-is.
+    return pages
 
 
 def gh_api_graphql(
