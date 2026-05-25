@@ -14,6 +14,7 @@ from ghci.checks import Outcome, classify_conclusion, fetch_pr_meta
 from ghci.gh import GhError, gh_api_download, gh_api_get, parse_http_status
 from ghci.ignore import IgnoreRule
 from ghci.target import (
+    EmptyTargetError,
     JobTarget,
     PrTarget,
     ResolvedTarget,
@@ -179,7 +180,15 @@ def _resolve_runs_for_target(
         )
         runs = data.get("workflow_runs", [])
         if not runs:
-            return []
+            # Recognized target but no runs: surface as EmptyTargetError so
+            # cli.py returns exit 2 with a clear message instead of silently
+            # treating this as "no logs to download" (exit 0).
+            raise EmptyTargetError(
+                f"Workflow {target.workflow_path!r} in "
+                f"{target.owner}/{target.repo} has no runs on branch "
+                f"{target.branch!r} (recognized target, but empty). "
+                f"Check the workflow filename and branch, or trigger a run."
+            )
         run = runs[0]
         jobs_data = gh_get(
             f"/repos/{target.owner}/{target.repo}/actions/runs/{run['id']}/jobs",

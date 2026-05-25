@@ -194,6 +194,82 @@ def test_gh_missing_exits_6(fake_gh):
     assert "gh" in err.getvalue()
 
 
+# Empty WorkflowTarget (recognized URL but no runs on branch) → exit 2 =====
+
+
+def test_status_empty_workflow_exits_2(fake_gh):
+    """Workflow URL parses fine, but the workflow has 0 runs on the
+    requested branch. status must exit 2 with a clear "recognized-but-empty"
+    message — not exit 4 ("no productive CI ran")."""
+    # Default branch lookup (no ?branch= in URL).
+    fake_gh.set_get("/repos/o/r", {"default_branch": "main"})
+    # Workflow runs query returns zero runs.
+    fake_gh.set_get(
+        "/repos/o/r/actions/workflows/ci.yml/runs?branch=main&per_page=1",
+        {"workflow_runs": []},
+    )
+    err = io.StringIO()
+    out = io.StringIO()
+    code = main(
+        ["status", "https://github.com/o/r/actions/workflows/ci.yml"],
+        gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+        stdout=out, stderr=err,
+    )
+    assert code == 2
+    msg = err.getvalue().lower()
+    assert "ci.yml" in err.getvalue()
+    assert "no runs" in msg or "empty" in msg
+    assert "main" in err.getvalue()
+
+
+def test_watch_empty_workflow_exits_2(fake_gh):
+    """Same recognized-but-empty case for watch — exit 2, not exit 4."""
+    fake_gh.set_get("/repos/o/r", {"default_branch": "main"})
+    fake_gh.set_get(
+        "/repos/o/r/actions/workflows/ci.yml/runs?branch=main&per_page=1",
+        {"workflow_runs": []},
+    )
+    err = io.StringIO()
+    out = io.StringIO()
+    code = main(
+        ["watch", "https://github.com/o/r/actions/workflows/ci.yml",
+         "--interval", "1s", "--timeout", "1s"],
+        gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+        stdout=out, stderr=err,
+    )
+    assert code == 2
+    msg = err.getvalue().lower()
+    assert "ci.yml" in err.getvalue()
+    assert "no runs" in msg or "empty" in msg
+    assert "main" in err.getvalue()
+
+
+def test_logs_empty_workflow_exits_2(fake_gh, tmp_path):
+    """Same recognized-but-empty case for logs — exit 2 with clear message,
+    not silent exit 0."""
+    fake_gh.set_get("/repos/o/r", {"default_branch": "main"})
+    fake_gh.set_get(
+        "/repos/o/r/actions/workflows/ci.yml/runs?branch=main&per_page=1",
+        {"workflow_runs": []},
+    )
+    err = io.StringIO()
+
+    def fake_download(path, dest, *, host=None):
+        raise AssertionError("should not download anything for empty workflow")
+
+    code = main(
+        ["logs", "https://github.com/o/r/actions/workflows/ci.yml",
+         "--output-dir", str(tmp_path)],
+        gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+        gh_download_fn=fake_download, stderr=err,
+    )
+    assert code == 2
+    msg = err.getvalue().lower()
+    assert "ci.yml" in err.getvalue()
+    assert "no runs" in msg or "empty" in msg
+    assert "main" in err.getvalue()
+
+
 # Unexpected exception → exit 1 with clean message =====
 
 

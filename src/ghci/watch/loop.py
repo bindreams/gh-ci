@@ -13,7 +13,7 @@ from ghci.checks import (
     fetch_pr_meta,
     fetch_run,
     fetch_run_jobs,
-    fetch_workflow_latest_run,
+    fetch_workflow_latest_run_or_raise,
 )
 from ghci.clock import Clock, RealClock
 from ghci.conflicts import ConflictOutcome, assess_pr, message_for
@@ -198,12 +198,14 @@ def _fetch_items(
         )
         return [item], None
     assert isinstance(target, WorkflowTarget)
-    run = fetch_workflow_latest_run(
+    # Raises EmptyTargetError if the workflow has no runs on the branch —
+    # caught at the cli.py main() entry to produce exit 2 with a clear
+    # message rather than silently returning [] (which downstream would
+    # misclassify as "no productive CI ran").
+    run = fetch_workflow_latest_run_or_raise(
         target.owner, target.repo, target.workflow_path,
         branch=target.branch, host=host, gh_get=gh_get,
     )
-    if run is None:
-        return [], None
     items = fetch_run_jobs(
         target.owner, target.repo, run["id"],
         workflow_name=run.get("name"), host=host, gh_get=gh_get,

@@ -13,7 +13,12 @@ from ghci.gh import GhError, gh_api_download, gh_api_get, gh_api_graphql
 from ghci.ignore import IgnoreParseError, IgnoreRule, parse_ignore
 from ghci.logs import run_logs
 from ghci.status import evaluate_snapshot
-from ghci.target import TargetParseError, host_for_gh, resolve_target
+from ghci.target import (
+    EmptyTargetError,
+    TargetParseError,
+    host_for_gh,
+    resolve_target,
+)
 
 
 class ExitCode(IntEnum):
@@ -85,6 +90,9 @@ def main(
     except KeyboardInterrupt:
         print("Interrupted", file=err)
         return int(ExitCode.SIGINT)
+    except EmptyTargetError as e:
+        print(str(e), file=err)
+        return int(ExitCode.BAD_ARGS)
     except FileNotFoundError as e:
         print(f"gh: not found ({e})", file=err)
         return int(ExitCode.GH_ERROR)
@@ -184,7 +192,14 @@ def _do_logs(args, *, gh_get, gh_download_fn, err) -> int:
 
 
 def _fetch_for_status(target, host, gh_get, gh_graphql_fn):
-    from ghci.checks import fetch_job, fetch_pr_checks, fetch_pr_meta, fetch_run, fetch_run_jobs, fetch_workflow_latest_run
+    from ghci.checks import (
+        fetch_job,
+        fetch_pr_checks,
+        fetch_pr_meta,
+        fetch_run,
+        fetch_run_jobs,
+        fetch_workflow_latest_run_or_raise,
+    )
     from ghci.target import JobTarget, PrTarget, RunTarget, WorkflowTarget
 
     if isinstance(target, PrTarget):
@@ -205,12 +220,12 @@ def _fetch_for_status(target, host, gh_get, gh_graphql_fn):
                           workflow_name=None, host=host, gh_get=gh_get)
         return [item], None
     assert isinstance(target, WorkflowTarget)
-    run = fetch_workflow_latest_run(target.owner, target.repo,
-                                      target.workflow_path,
-                                      branch=target.branch,
-                                      host=host, gh_get=gh_get)
-    if run is None:
-        return [], None
+    # Raises EmptyTargetError if the workflow has no runs on the branch —
+    # caught at the main() entry to produce exit 2 with a clear message.
+    run = fetch_workflow_latest_run_or_raise(
+        target.owner, target.repo, target.workflow_path,
+        branch=target.branch, host=host, gh_get=gh_get,
+    )
     items = fetch_run_jobs(target.owner, target.repo, run["id"],
                             workflow_name=run.get("name"),
                             host=host, gh_get=gh_get)
