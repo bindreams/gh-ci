@@ -372,7 +372,23 @@ def test_color_auto_with_force_color_env_disables_via_tty_check(fake_gh, monkeyp
 
 
 def test_color_auto_with_tty_enables(fake_gh, monkeypatch):
+    """--color=auto + TTY stderr enables, even when NO_COLOR=1 is set.
+
+    This is the strongest proof of the env-var bypass: a non-auto path
+    would see NO_COLOR=1 and disable; auto-mode skips env entirely.
+    """
     monkeypatch.setenv("NO_COLOR", "1")  # bypassed by auto
+    err = _TtyStub()
+    code = main(["--color=auto", "status", "not a url"],
+                gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+                stderr=err)
+    assert code == 2
+    assert "\033[31m" in err.getvalue()
+
+
+def test_color_auto_with_tty_and_force_color_zero_still_enables(fake_gh, monkeypatch):
+    """Symmetric proof of the bypass: FORCE_COLOR=0 is ignored under auto."""
+    monkeypatch.setenv("FORCE_COLOR", "0")  # bypassed by auto
     err = _TtyStub()
     code = main(["--color=auto", "status", "not a url"],
                 gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
@@ -392,12 +408,16 @@ def test_flag_omitted_no_color_wins_over_force_color(fake_gh, monkeypatch):
     assert "\033[" not in err.getvalue()
 
 
-def test_argparse_error_not_colored(fake_gh):
-    """Documented limitation: SystemExit fires before palette is built."""
-    err = io.StringIO()
+def test_argparse_error_not_colored(fake_gh, capsys):
+    """Documented limitation: SystemExit fires before palette is built.
+
+    argparse writes its own messages to the real sys.stderr (not the
+    injected stream, since parsing precedes palette construction). Capture
+    via capsys to assert no ANSI codes leaked.
+    """
     code = main(["--color=always", "no-such-subcommand", "x"],
-                gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
-                stderr=err)
+                gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql)
     assert code != 0
-    # The argparse-generated error in err is not colored.
-    assert "\033[" not in err.getvalue()
+    captured = capsys.readouterr()
+    assert "\033[" not in captured.err
+    assert "\033[" not in captured.out

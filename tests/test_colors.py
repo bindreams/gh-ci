@@ -89,8 +89,10 @@ def test_default_no_color_wins_over_force_color():
 
 
 def test_no_color_empty_treated_as_unset():
-    # "set and non-empty" per the spec.
-    assert decide_color(None, stderr=_non_tty(), env={"NO_COLOR": ""}) is False
+    # "set and non-empty" per the spec. Use a TTY stub so the non-TTY
+    # fallback can't make this assertion non-discriminating: if "" were
+    # ever treated as set, the result here would be False.
+    assert decide_color(None, stderr=_tty(), env={"NO_COLOR": ""}) is True
     # Also: NO_COLOR="" does not block FORCE_COLOR.
     assert (
         decide_color(
@@ -188,6 +190,15 @@ def test_enabled_palette_single_reset_per_style():
 
 def test_enabled_palette_rejects_unknown_color():
     p = Palette(True)
+    with pytest.raises(KeyError):
+        p.style("x", color="purple")
+
+
+def test_disabled_palette_also_rejects_unknown_color():
+    # Eager validation: a typo in a color name surfaces uniformly under
+    # both --color=always and --color=never. Otherwise a misspelling
+    # would silently pass in scripts and crash interactively.
+    p = Palette(False)
     with pytest.raises(KeyError):
         p.style("x", color="purple")
 

@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from ghci.colors import Palette, ensure_palette
-from ghci.status import _GroupStyle, _GROUP_STYLE_COLOR
+from ghci.colors import GROUP_STYLE_COLOR, Palette, _GroupStyle, ensure_palette
 from ghci.watch.state import Event
 
 
@@ -52,13 +51,14 @@ def format_event_line(
     if event.kind == "concluded":
         raw = event.conclusion or ""
         word = _CONCLUSION_WORDS.get(raw, raw or "?")
-        style = _CONCLUSION_STYLE.get(raw)
-        if style is None:
-            colored_word = word
-        elif style is _GroupStyle.NEUTRAL:
+        # Unknown conclusion strings fall back to the same yellow we use
+        # for the "Unknown" group in summaries — keeps the two surfaces
+        # visually consistent.
+        style = _CONCLUSION_STYLE.get(raw, _GroupStyle.UNKNOWN)
+        if style == _GroupStyle.NEUTRAL:
             colored_word = p.style(word, dim=True)
         else:
-            color = _GROUP_STYLE_COLOR[style]
+            color = GROUP_STYLE_COLOR[style]
             colored_word = p.style(word, color=color)
         return f'{ts}  Job "{event.name}" {colored_word}'
     return f'{ts}  Job "{event.name}" {event.kind}'

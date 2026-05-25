@@ -135,3 +135,13 @@ def test_force_push_line_byte_identical_when_palette_disabled():
     expected = "13:55:02  Force-push detected — now watching SHA abc1234"
     assert format_force_push_line(when=WHEN, new_sha="abc1234deadbeef") == expected
     assert format_force_push_line(when=WHEN, new_sha="abc1234deadbeef", palette=Palette(False)) == expected
+
+
+def test_unknown_conclusion_word_colored_yellow_for_consistency_with_summary():
+    """Unknown conclusion strings on event lines match the summary's
+    Unknown group color (yellow), preventing visual drift between the
+    two surfaces."""
+    item = _item("Future", "future_thing")
+    evt = Event(kind="concluded", name="Future", item=item, conclusion="future_thing")
+    line = format_event_line(evt, when=WHEN, palette=Palette(True))
+    assert "\033[33mfuture_thing\033[0m" in line

@@ -16,11 +16,11 @@ from ghci.checks import (
     fetch_workflow_latest_run_or_raise,
 )
 from ghci.clock import Clock, RealClock
-from ghci.colors import Palette, _ResultStyle, ensure_palette
+from ghci.colors import RESULT_STYLE_COLOR, Palette, _ResultStyle, ensure_palette
 from ghci.conflicts import ConflictOutcome, assess_pr, message_for, result_style_for
 from ghci.gh import gh_api_get, gh_api_graphql
 from ghci.ignore import IgnoreRule, matches as ignore_matches
-from ghci.status import _RESULT_STYLE_COLOR, format_summary
+from ghci.status import format_summary
 from ghci.target import (
     JobTarget,
     PrTarget,
@@ -165,7 +165,7 @@ def _conflict_summary(
     result_line = f"Result: {outcome.value}"
     style = result_style_for(outcome)
     if style is not None:
-        color = _RESULT_STYLE_COLOR[style]
+        color = RESULT_STYLE_COLOR[style]
         result_line = p.style(result_line, color=color, bold=True)
     return f"{result_line}\n{message_for(outcome, pr_number=pr_number)}"
 
