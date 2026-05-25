@@ -85,8 +85,8 @@ def main(
             return _do_watch(args, gh_get=gh_get, gh_graphql_fn=gh_graphql_fn,
                              out=out, err=err, clock=clk, run_watch_fn=run_watch)
         if args.subcommand == "logs":
-            return _do_logs(args, gh_get=gh_get, gh_download_fn=gh_download_fn,
-                            err=err)
+            return _do_logs(args, gh_get=gh_get, gh_graphql_fn=gh_graphql_fn,
+                            gh_download_fn=gh_download_fn, err=err)
     except KeyboardInterrupt:
         print("Interrupted", file=err)
         return int(ExitCode.SIGINT)
@@ -166,7 +166,7 @@ def _do_watch(args, *, gh_get, gh_graphql_fn, out, err, clock, run_watch_fn) -> 
     return code
 
 
-def _do_logs(args, *, gh_get, gh_download_fn, err) -> int:
+def _do_logs(args, *, gh_get, gh_graphql_fn, gh_download_fn, err) -> int:
     target_result = _resolve_or_exit_2(args.target, gh_get=gh_get, err=err)
     if isinstance(target_result, int):
         return target_result
@@ -184,6 +184,7 @@ def _do_logs(args, *, gh_get, gh_download_fn, err) -> int:
         output_dir=output_dir,
         stderr=err,
         gh_get=gh_get,
+        gh_graphql_fn=gh_graphql_fn,
         gh_download_fn=gh_download_fn,
     )
 
