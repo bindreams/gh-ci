@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -333,3 +334,41 @@ def test_gh_api_download_404_carries_http_status(fp, tmp_path: Path):
     assert parse_http_status(exc.value.stderr) == 404
     # No tmp file when zero bytes were written before failure
     assert exc.value.bytes_written == 0
+
+
+def test_gh_api_download_passes_stdin_devnull(monkeypatch, tmp_path: Path):
+    # Regression: gh_api_download must pass stdin=subprocess.DEVNULL to
+    # subprocess.Popen so the child process does not inherit the parent's
+    # stdin. If `gh` prompts for interactive auth (or anything else), it
+    # would otherwise hang waiting for input the agent will never provide.
+    captured: dict[str, object] = {}
+    real_popen = subprocess.Popen
+
+    class _FakeProc:
+        def __init__(self, args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            self.stdout = _Empty()
+            self.stderr = _Empty()
+            self.returncode = 0
+
+        def wait(self):
+            return 0
+
+        def kill(self):
+            pass
+
+    class _Empty:
+        def read(self, *_a, **_k):
+            return b""
+
+    def fake_popen(args, **kwargs):
+        return _FakeProc(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    try:
+        gh_api_download("/jobs/1/logs", tmp_path / "out.log")
+    finally:
+        monkeypatch.setattr(subprocess, "Popen", real_popen)
+
+    assert captured["kwargs"].get("stdin") is subprocess.DEVNULL
