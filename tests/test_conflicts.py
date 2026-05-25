@@ -40,6 +40,18 @@ def test_open_mergeable_null_is_unknown():
     assert assess_pr(pr) == ConflictOutcome.UNKNOWN
 
 
+def test_open_missing_mergeable_state_is_unknown():
+    # Regression: partial gh response / mocked fixture without mergeable_state.
+    pr = {"state": "open", "mergeable": True}
+    assert assess_pr(pr) == ConflictOutcome.UNKNOWN
+
+
+def test_open_missing_both_keys_is_unknown():
+    # Regression: neither mergeable nor mergeable_state present.
+    pr = {"state": "open"}
+    assert assess_pr(pr) == ConflictOutcome.UNKNOWN
+
+
 def test_closed_pr_is_closed():
     pr = {"state": "closed", "mergeable": False, "mergeable_state": "dirty"}
     assert assess_pr(pr) == ConflictOutcome.CLOSED
