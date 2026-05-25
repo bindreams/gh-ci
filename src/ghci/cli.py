@@ -91,6 +91,13 @@ def main(
     except GhError as e:
         print(f"gh: {e.stderr.strip()}", file=err)
         return int(ExitCode.GH_ERROR)
+    except Exception as e:
+        # Catch-all for unexpected errors (OSError, etc.). Print a clean,
+        # one-line message — no traceback — and exit 1. KeyboardInterrupt
+        # inherits from BaseException (not Exception), so it stays handled
+        # above and won't be swallowed here.
+        print(f"gh-ci: unexpected error: {e}", file=err)
+        return int(ExitCode.UNEXPECTED)
 
     return int(ExitCode.UNEXPECTED)
 
