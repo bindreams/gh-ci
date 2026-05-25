@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ghci.checks import CheckItem
 from ghci.ignore import IgnoreRule
-from ghci.status import evaluate_snapshot
+from ghci.status import evaluate_snapshot, format_summary
 
 
 def _item(name, *, status="completed", conclusion="success", workflow_name="CI",
@@ -51,6 +51,16 @@ def test_unknown_pr_exits_7():
     code, summary = evaluate_snapshot([], pr_meta=pr, pr_number=1, ignore_rules=[])
     assert code == 7
     assert "computing" in summary.lower() or "still" in summary.lower()
+
+
+def test_s3_unknown_pr_summary_matches_plan_wording():
+    # Plan §status step 4: "Mergeability still computing; retry with watch."
+    # The PR-# prefix must be dropped from the user-facing message.
+    pr = {"state": "open", "mergeable": None, "mergeable_state": "unknown"}
+    code, summary = evaluate_snapshot([], pr_meta=pr, pr_number=42, ignore_rules=[])
+    assert code == 7
+    assert "Mergeability still computing; retry with watch." in summary
+    assert "PR #42" not in summary
 
 
 # Item evaluation =====
@@ -170,3 +180,60 @@ def test_empty_groups_are_omitted():
     assert "Failed:" not in summary
     assert "Skipped:" not in summary
     assert "Cancelled:" not in summary
+
+
+# format_summary unit tests for stalled/in-flight dedup (S5 follow-up) =====
+
+
+def test_format_summary_dedupes_stalled_from_in_flight_by_full_key():
+    # Two checks share the name "validate" but differ by (kind, workflow_name):
+    # - one is a stalled required status_context (state==expected),
+    # - the other is an in-flight Actions job.
+    # The stalled one must appear ONLY under "Not reported (stalled)"; the
+    # in-flight Actions job must still appear in the "In progress" group.
+    # Deduping by name alone would incorrectly omit the in-flight item.
+    stalled = CheckItem(
+        kind="status_context", name="validate", workflow_name=None,
+        status="expected", conclusion=None, url=None, required=True,
+        check_run_id=None, run_id=None, workflow_run_url=None,
+    )
+    in_flight_actions = CheckItem(
+        kind="actions", name="validate", workflow_name="CI",
+        status="in_progress", conclusion=None, url=None, required=False,
+        check_run_id=1, run_id=1, workflow_run_url=None,
+    )
+    summary = format_summary(
+        [stalled, in_flight_actions], [],
+        result_line="Result: required check stalled",
+        in_flight_label="In progress",
+        stalled_items=[stalled],
+    )
+    assert "Not reported (stalled): validate" in summary
+    assert "In progress: validate" in summary
+
+
+def test_format_summary_unknown_group_catches_unrecognized_conclusion():
+    # Defensive: if GitHub adds a new conclusion string our group map
+    # doesn't know about, the item must still appear under Unknown rather
+    # than silently disappearing.
+    weird = CheckItem(
+        kind="actions", name="future-thing", workflow_name="CI",
+        status="completed", conclusion="newly_added_conclusion",
+        url=None, required=False,
+        check_run_id=None, run_id=None, workflow_run_url=None,
+    )
+    summary = format_summary([weird], [], result_line="Result: green")
+    assert "Unknown: future-thing" in summary
+
+
+def test_format_summary_unknown_ignored_group_appears():
+    # Coverage for the S6 ignored variant: an ignored item with status=
+    # completed and conclusion=None should appear under
+    # "Unknown (ignored by --ignore)".
+    ignored = CheckItem(
+        kind="actions", name="weird", workflow_name="CI",
+        status="completed", conclusion=None, url=None, required=False,
+        check_run_id=None, run_id=None, workflow_run_url=None,
+    )
+    summary = format_summary([ignored], [ignored], result_line="Result: green")
+    assert "Unknown (ignored by --ignore): weird" in summary

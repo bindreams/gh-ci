@@ -83,6 +83,13 @@ _GROUP_ORDER: tuple[tuple[str, str | None], ...] = (
     ("Stale", "stale"),
 )
 
+# Conclusion strings already covered by a dedicated group. Anything else
+# (including None and any future GitHub-added conclusion) falls into the
+# Unknown bucket so it can't silently vanish from summaries.
+_KNOWN_CONCLUSIONS: frozenset[str] = frozenset(
+    c for _, c in _GROUP_ORDER if c is not None
+)
+
 
 def format_summary(
     all_items: list[CheckItem],
@@ -90,7 +97,7 @@ def format_summary(
     *,
     result_line: str,
     in_flight_label: str | None = None,
-    stalled_names: Iterable[str] | None = None,
+    stalled_items: Iterable[CheckItem] | None = None,
 ) -> str:
     active = [it for it in all_items if it not in ignored_items]
 
@@ -100,19 +107,43 @@ def format_summary(
         if names:
             groups[label] = names
 
+    # Materialize stalled_items once (it may be an Iterable / generator).
+    # Stalled items appear in their own "Not reported (stalled)" group; do
+    # not also surface them as In progress. Dedupe by (kind, name,
+    # workflow_name) — name alone is insufficient because two checks may
+    # share a name across different kinds or workflows (matrix builds, a
+    # status context and an Actions job with the same display name, etc.).
+    stalled_items_list: list[CheckItem] = list(stalled_items) if stalled_items else []
+    stalled_keys: set[tuple[str, str, str | None]] = {
+        (it.kind, it.name, it.workflow_name) for it in stalled_items_list
+    }
+
     if in_flight_label:
         in_flight_names = [
             it.name
             for it in active
-            if it.status != "completed" and classify_conclusion(it.conclusion) is None
+            if it.status != "completed"
+            and classify_conclusion(it.conclusion) is None
+            and (it.kind, it.name, it.workflow_name) not in stalled_keys
         ]
         if in_flight_names:
             groups[in_flight_label] = in_flight_names
 
-    if stalled_names:
-        names = list(stalled_names)
-        if names:
-            groups["Not reported (stalled)"] = names
+    # S6: terminal items whose conclusion isn't None and isn't in the known
+    # group set would otherwise vanish from the summary. This covers both
+    # the original pathological completed/None case AND any future-or-rare
+    # conclusion strings GitHub might introduce. Surface them under
+    # "Unknown".
+    unknown_active = [
+        it.name
+        for it in active
+        if it.status == "completed" and it.conclusion not in _KNOWN_CONCLUSIONS
+    ]
+    if unknown_active:
+        groups["Unknown"] = unknown_active
+
+    if stalled_items_list:
+        groups["Not reported (stalled)"] = [it.name for it in stalled_items_list]
 
     for label, conclusion in _GROUP_ORDER:
         names = [it.name for it in ignored_items if (it.conclusion or "") == (conclusion or "")]
@@ -127,6 +158,15 @@ def format_summary(
     ]
     if ig_in_flight:
         groups["In progress (ignored by --ignore)"] = ig_in_flight
+
+    # S6 (ignored variant): mirror the Unknown group for ignored items.
+    ig_unknown = [
+        it.name
+        for it in ignored_items
+        if it.status == "completed" and it.conclusion not in _KNOWN_CONCLUSIONS
+    ]
+    if ig_unknown:
+        groups["Unknown (ignored by --ignore)"] = ig_unknown
 
     lines = [result_line]
     for label, names in groups.items():

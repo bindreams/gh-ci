@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 import io
-from typing import Any
-
-import pytest
 
 from ghci.clock import FakeClock
 from ghci.ignore import IgnoreRule
@@ -248,10 +245,10 @@ def test_initial_head_sha_falls_back_to_rest_when_graphql_null(fake_gh):
     )
     code, summary, stderr, _ = _run_watch_pr(fake_gh, interval=5.0)
     assert code == 0
-    # The resolution line includes the head SHA prefix when present — this
-    # is the user-observable proof that state.head_sha was seeded from REST.
-    assert rest_sha[:7] in stderr
-    # And no spurious force-push line was emitted on tick 1.
+    # The regression's real assertion: no spurious force-push line was
+    # emitted on tick 1, because state.head_sha was seeded from REST at
+    # init time. (The resolution line now leads with the workflow run id
+    # per the plan, so the head SHA is not necessarily in stderr.)
     assert "Force-push detected" not in stderr
 
 
@@ -277,6 +274,162 @@ def test_force_push_event_emitted(fake_gh):
     assert code == 0
     assert "Force-push detected" in stderr
     assert "newsha2"[:7] in stderr
+
+
+# Spec divergences S1, S2, S5, S6 (PR-target wording / summary groups) =====
+
+
+# S1: resolution line wording for PR targets
+def test_s1_resolution_line_includes_run_id_when_actions_present(fake_gh):
+    # PR has at least one actions check → resolution line includes the run id.
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    # Need to proceed into loop, then exit green. Single in-flight then green.
+    fake_gh.queue_graphql(
+        _graphql_payload(
+            [_node("build", status="IN_PROGRESS", conclusion=None, db_id=1)],
+            head_sha="abcdef0123456",
+        ),
+        _graphql_payload(
+            [_node("build", status="COMPLETED", conclusion="SUCCESS", db_id=1)],
+            head_sha="abcdef0123456",
+        ),
+    )
+    code, _, stderr, _ = _run_watch_pr(fake_gh, interval=5.0)
+    assert code == 0
+    # Plan format: "Watching run 100 (in progress) on PR #1 in o/r"
+    # (run id 100 comes from _node default workflowRun.databaseId=100;
+    # status "in progress" comes from first CheckItem at resolution time.)
+    assert "Watching run 100 (in progress) on PR #1 in o/r" in stderr
+
+
+def test_s1_resolution_line_aggregates_status_across_jobs_in_same_run(fake_gh):
+    # Two jobs in the SAME run: the first (by rollup order) is completed,
+    # the second is still in_progress. The resolution line must report the
+    # run as "(in progress)" — taking just the first item's status would
+    # incorrectly say "(completed)".
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    fake_gh.queue_graphql(
+        _graphql_payload([
+            _node("lint", status="COMPLETED", conclusion="SUCCESS", db_id=1),
+            _node("test", status="IN_PROGRESS", conclusion=None, db_id=2),
+        ]),
+        # Tick 1: second job finishes green so we exit cleanly with code 0.
+        _graphql_payload([
+            _node("lint", status="COMPLETED", conclusion="SUCCESS", db_id=1),
+            _node("test", status="COMPLETED", conclusion="SUCCESS", db_id=2),
+        ]),
+    )
+    code, _, stderr, _ = _run_watch_pr(fake_gh, interval=5.0)
+    assert code == 0
+    assert "Watching run 100 (in progress) on PR #1 in o/r" in stderr
+
+
+def test_s1_resolution_line_uses_status_not_conclusion_when_completed(fake_gh):
+    # The parenthesized text is the CheckItem's *status* (queued /
+    # in_progress / completed), not its terminal conclusion. A completed
+    # Actions check must render as "(completed)" — not "(success)".
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    fake_gh.queue_graphql(
+        _graphql_payload(
+            [_node("build", status="COMPLETED", conclusion="SUCCESS", db_id=1)],
+            head_sha="abcdef0123456",
+        ),
+    )
+    code, _, stderr, _ = _run_watch_pr(fake_gh)
+    assert code == 0
+    assert "Watching run 100 (completed) on PR #1 in o/r" in stderr
+    assert "(success)" not in stderr
+
+
+def test_s1_resolution_line_falls_back_to_sha_when_no_actions(fake_gh):
+    # PR has no actions-kind check (e.g. only status contexts) →
+    # fall back to the SHA-style line.
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    # Use a status context only (no actions); make it failed so we exit
+    # quickly without needing more snapshots.
+    sc_node = {
+        "__typename": "StatusContext",
+        "context": "external/ci",
+        "state": "FAILURE",
+        "targetUrl": None,
+        "isRequired": False,
+    }
+    fake_gh.queue_graphql(_graphql_payload([sc_node], head_sha="deadbee1234567"))
+    code, _, stderr, _ = _run_watch_pr(fake_gh)
+    assert code == 3
+    # Falls back to PR # + SHA (no run id available).
+    assert "Watching PR #1 in o/r (head deadbee)" in stderr
+
+
+# S2: stalled-check message format
+def test_s2_stalled_message_quotes_name_and_uses_plan_wording(fake_gh):
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    fake_gh.queue_graphql(*[
+        _graphql_payload([_status_context("ci/external", state="EXPECTED", required=True)])
+        for _ in range(100)
+    ])
+    clock = FakeClock()
+    code, summary, _, _ = _run_watch_pr(
+        fake_gh, interval=5.0, stalled_timeout=60.0, clock=clock,
+    )
+    assert code == 5
+    # The plan substring must appear verbatim in the summary.
+    assert (
+        'Required check "ci/external" has not reported in 60s — likely misconfigured.'
+        in summary
+    )
+    # Result line is the short label, not the long one.
+    assert "Result: required check stalled" in summary
+
+
+# S5: include In progress group on red and stalled exits
+def test_s5_red_exit_includes_in_progress_group(fake_gh):
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    # First snapshot already has a red and an in-flight non-ignored job.
+    fake_gh.queue_graphql(_graphql_payload([
+        _node("bad", status="COMPLETED", conclusion="FAILURE", db_id=1),
+        _node("still-running", status="IN_PROGRESS", conclusion=None, db_id=2),
+    ]))
+    code, summary, _, _ = _run_watch_pr(fake_gh)
+    assert code == 3
+    assert "Failed: bad" in summary
+    assert "In progress: still-running" in summary
+
+
+def test_s5_stalled_exit_includes_in_progress_group(fake_gh):
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    # Required EXPECTED context + a separate in-flight job that is not the
+    # stalled one.
+    nodes_stalled_plus_in_flight = [
+        _status_context("ci/external", state="EXPECTED", required=True),
+        _node("other-job", status="IN_PROGRESS", conclusion=None, db_id=99),
+    ]
+    fake_gh.queue_graphql(*[
+        _graphql_payload(nodes_stalled_plus_in_flight)
+        for _ in range(100)
+    ])
+    clock = FakeClock()
+    code, summary, _, _ = _run_watch_pr(
+        fake_gh, interval=5.0, stalled_timeout=60.0, clock=clock,
+    )
+    assert code == 5
+    assert "In progress: other-job" in summary
+
+
+# S6: items with status=completed conclusion=None get an Unknown group
+def test_s6_completed_without_conclusion_grouped_as_unknown(fake_gh):
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    # A passing job (so we hit exit 0) plus a pathological completed/no-
+    # conclusion item. Both completed → exit 0 path; the second must appear
+    # in an "Unknown:" group rather than vanishing from the summary.
+    fake_gh.queue_graphql(_graphql_payload([
+        _node("ok", status="COMPLETED", conclusion="SUCCESS", db_id=1),
+        _node("weird", status="COMPLETED", conclusion=None, db_id=2),
+    ]))
+    code, summary, _, _ = _run_watch_pr(fake_gh)
+    assert code == 0
+    assert "Passed: ok" in summary
+    assert "Unknown: weird" in summary
 
 
 # Non-PR target — runs without PR meta check =====
