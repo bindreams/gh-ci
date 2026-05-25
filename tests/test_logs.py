@@ -538,6 +538,62 @@ def test_fork_pr_target_uses_check_runs_rollup(fake_gh, tmp_path):
     assert manifest["target_kind"] == "pr"
 
 
+# Final summary line counts partials =====
+
+
+def test_final_summary_counts_partials_in_written(fake_gh, tmp_path):
+    """Regression for bug #9: the final 'Wrote N logs (...)' line should count
+    every log file we wrote — including .partial.log files — toward N. The
+    partial bucket is a subset breakdown, not a separate disjoint group.
+
+    Setup: 1 completed job (writes .log) + 2 in-progress jobs (each writes
+    .partial.log) + 1 queued job (404 → no file). Expected final line:
+    'Wrote 3 logs (2 partial, 0 truncated, 1 with no logs available)'."""
+    fake_gh.set_get(
+        "/repos/o/r/actions/runs/1000",
+        {"id": 1000, "name": "CI", "status": "in_progress"},
+    )
+    fake_gh.set_get(
+        "/repos/o/r/actions/runs/1000/jobs",
+        {"jobs": [
+            {"id": 1, "name": "complete-job", "status": "completed",
+             "conclusion": "success", "started_at": "S", "completed_at": "E",
+             "html_url": "u", "run_id": 1000},
+            {"id": 2, "name": "in-progress-a", "status": "in_progress",
+             "conclusion": None, "started_at": "S", "completed_at": None,
+             "html_url": "u", "run_id": 1000},
+            {"id": 3, "name": "in-progress-b", "status": "in_progress",
+             "conclusion": None, "started_at": "S", "completed_at": None,
+             "html_url": "u", "run_id": 1000},
+            {"id": 4, "name": "queued-job", "status": "queued",
+             "conclusion": None, "started_at": None, "completed_at": None,
+             "html_url": "u", "run_id": 1000},
+        ]},
+    )
+    dl = FakeDownload()
+    dl.set_ok("/repos/o/r/actions/jobs/1/logs", b"complete log")
+    dl.set_ok("/repos/o/r/actions/jobs/2/logs", b"partial a")
+    dl.set_ok("/repos/o/r/actions/jobs/3/logs", b"partial b")
+    dl.set_error("/repos/o/r/actions/jobs/4/logs",
+                 returncode=1, stderr="gh: HTTP 404: Not Found")
+
+    err = io.StringIO()
+    code = run_logs(
+        target=RunTarget(owner="o", repo="r", host="github.com", run_id=1000),
+        failed_only=False, ignore_rules=[], output_dir=tmp_path,
+        stderr=err, gh_get=fake_gh.gh_get, gh_download_fn=dl, now=NOW,
+    )
+    assert code == 0
+    # Final summary line should count all 3 log files (1 complete + 2 partial)
+    # toward 'Wrote N', with partial as a subset breakdown.
+    lines = err.getvalue().splitlines()
+    summary_lines = [ln for ln in lines if ln.startswith("Wrote ")]
+    assert len(summary_lines) == 1, f"expected 1 summary line, got: {summary_lines}"
+    assert summary_lines[0] == (
+        "Wrote 3 logs (2 partial, 0 truncated, 1 with no logs available)"
+    ), f"unexpected summary line: {summary_lines[0]!r}"
+
+
 # Output dir mkdir =====
 
 

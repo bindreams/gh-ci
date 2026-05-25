@@ -95,10 +95,11 @@ def run_logs(
             )
             manifest_jobs.append(entry)
             if entry["log_file"]:
+                # Any log file counts toward 'written'; 'partial' is a subset
+                # of 'written' (partial files are still files we wrote).
+                summary_counts["written"] += 1
                 if entry["partial"]:
                     summary_counts["partial"] += 1
-                else:
-                    summary_counts["written"] += 1
                 if entry["truncated"]:
                     summary_counts["truncated"] += 1
                 abs_path = (run_dir / entry["log_file"]).resolve()
