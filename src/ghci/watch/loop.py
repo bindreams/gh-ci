@@ -16,10 +16,11 @@ from ghci.checks import (
     fetch_workflow_latest_run_or_raise,
 )
 from ghci.clock import Clock, RealClock
-from ghci.conflicts import ConflictOutcome, assess_pr, message_for
+from ghci.colors import Palette, _ResultStyle, ensure_palette
+from ghci.conflicts import ConflictOutcome, assess_pr, message_for, result_style_for
 from ghci.gh import gh_api_get, gh_api_graphql
 from ghci.ignore import IgnoreRule, matches as ignore_matches
-from ghci.status import format_summary
+from ghci.status import _RESULT_STYLE_COLOR, format_summary
 from ghci.target import (
     JobTarget,
     PrTarget,
@@ -48,6 +49,7 @@ def run_watch(
     stderr: TextIO | None = None,
     gh_get: Callable[..., Any] = gh_api_get,
     gh_graphql_fn: Callable[..., dict] = gh_api_graphql,
+    palette: Palette | None = None,
 ) -> tuple[int, str]:
     """Run the watch poll loop. Returns (exit_code, summary_text).
 
@@ -55,6 +57,7 @@ def run_watch(
     """
     clk = clock or RealClock()
     err = stderr or sys.stderr
+    p = ensure_palette(palette)
     host = host_for_gh(target)
 
     # Pre-loop conflict check.
@@ -66,7 +69,7 @@ def run_watch(
         )
         outcome = assess_pr(pr_meta)
         if outcome in (ConflictOutcome.CLOSED, ConflictOutcome.DIRTY, ConflictOutcome.BEHIND):
-            return 4, _conflict_summary(outcome, target.pr_number)
+            return 4, _conflict_summary(outcome, target.pr_number, palette=p)
         # OK or UNKNOWN — fall through.
 
     # Initial item fetch + resolution line.
@@ -82,7 +85,8 @@ def run_watch(
         rest_sha = rest_head.get("sha") if isinstance(rest_head, dict) else None
         if rest_sha:
             head_sha = rest_sha
-    print(_resolution_line(target, head_sha, items, ignore_rules), file=err, flush=True)
+    resolution = _resolution_line(target, head_sha, items, ignore_rules)
+    print(p.style(resolution, dim=True), file=err, flush=True)
 
     state = initial_state(items, head_sha=head_sha)
 
@@ -92,6 +96,7 @@ def run_watch(
         state, ignore_rules=ignore_rules, now=clk.now(),
         stalled_timeout=None,
         timed_out=False,
+        palette=p,
     )
     if decision is not None:
         return decision
@@ -109,7 +114,7 @@ def run_watch(
             )
             outcome = assess_pr(pr_meta)
             if outcome in (ConflictOutcome.CLOSED, ConflictOutcome.DIRTY, ConflictOutcome.BEHIND):
-                return 4, _conflict_summary(outcome, target.pr_number)
+                return 4, _conflict_summary(outcome, target.pr_number, palette=p)
 
         # Refetch.
         items, meta = _fetch_items(target, gh_get=gh_get, gh_graphql_fn=gh_graphql_fn, host=host)
@@ -123,24 +128,25 @@ def run_watch(
         when = datetime.now()
         if force_pushed:
             print(
-                format_force_push_line(when=when, new_sha=new_head_sha or "?"),
+                format_force_push_line(when=when, new_sha=new_head_sha or "?", palette=p),
                 file=err, flush=True,
             )
             # Skip exit-condition eval on force-push tick. Just check timeout.
             if timeout > 0 and (clk.now() - start_time) > timeout:
-                return _timeout_summary(state, ignore_rules)
+                return _timeout_summary(state, ignore_rules, palette=p)
             continue
 
         for evt in events:
-            print(format_event_line(evt, when=when), file=err, flush=True)
+            print(format_event_line(evt, when=when, palette=p), file=err, flush=True)
 
         # Timeout takes priority over normal exit conditions.
         if timeout > 0 and (clk.now() - start_time) > timeout:
-            return _timeout_summary(state, ignore_rules)
+            return _timeout_summary(state, ignore_rules, palette=p)
 
         decision = _evaluate_exit(
             state, ignore_rules=ignore_rules, now=clk.now(),
             stalled_timeout=stalled_timeout, timed_out=False,
+            palette=p,
         )
         if decision is not None:
             return decision
@@ -149,8 +155,19 @@ def run_watch(
 # Helpers =====
 
 
-def _conflict_summary(outcome: ConflictOutcome, pr_number: int) -> str:
-    return f"Result: {outcome.value}\n{message_for(outcome, pr_number=pr_number)}"
+def _conflict_summary(
+    outcome: ConflictOutcome,
+    pr_number: int,
+    *,
+    palette: Palette | None = None,
+) -> str:
+    p = ensure_palette(palette)
+    result_line = f"Result: {outcome.value}"
+    style = result_style_for(outcome)
+    if style is not None:
+        color = _RESULT_STYLE_COLOR[style]
+        result_line = p.style(result_line, color=color, bold=True)
+    return f"{result_line}\n{message_for(outcome, pr_number=pr_number)}"
 
 
 def _resolution_line(
@@ -305,8 +322,10 @@ def _evaluate_exit(
     now: float,
     stalled_timeout: float | None,
     timed_out: bool,
+    palette: Palette | None = None,
 ) -> tuple[int, str] | None:
     """Returns (code, summary) if an exit condition fires; else None."""
+    p = ensure_palette(palette)
     items = list(state.items_by_key.values())
     ignored = [it for it in items if ignore_matches(it, ignore_rules)]
     active = [it for it in items if not ignore_matches(it, ignore_rules)]
@@ -325,6 +344,7 @@ def _evaluate_exit(
         return 3, format_summary(
             items, ignored, result_line=result_line,
             in_flight_label="In progress",
+            result_style=_ResultStyle.RED, palette=p,
         )
 
     # 2. Stalled.
@@ -345,6 +365,7 @@ def _evaluate_exit(
             return 5, format_summary(
                 items, ignored, result_line=result_line,
                 stalled_items=stalled, in_flight_label="In progress",
+                result_style=_ResultStyle.RED, palette=p,
             )
 
     # 3. All done?
@@ -352,18 +373,29 @@ def _evaluate_exit(
     if not in_flight:
         passes = [it for it in active if classify_conclusion(it.conclusion) == Outcome.PASSED]
         if passes:
-            return 0, format_summary(items, ignored, result_line="Result: green")
+            return 0, format_summary(
+                items, ignored, result_line="Result: green",
+                result_style=_ResultStyle.GREEN, palette=p,
+            )
         return 4, format_summary(
             items, ignored, result_line="Result: no productive CI ran",
+            result_style=_ResultStyle.RED, palette=p,
         )
     return None
 
 
-def _timeout_summary(state: WatchState, ignore_rules: list[IgnoreRule]) -> tuple[int, str]:
+def _timeout_summary(
+    state: WatchState,
+    ignore_rules: list[IgnoreRule],
+    *,
+    palette: Palette | None = None,
+) -> tuple[int, str]:
+    p = ensure_palette(palette)
     items = list(state.items_by_key.values())
     ignored = [it for it in items if ignore_matches(it, ignore_rules)]
     result_line = "Result: timeout reached while watching"
     return 7, format_summary(
         items, ignored, result_line=result_line,
         in_flight_label="In progress (timed out)",
+        result_style=_ResultStyle.YELLOW, palette=p,
     )

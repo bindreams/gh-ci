@@ -9,6 +9,7 @@ from typing import Any, Callable, TextIO
 import pytimeparse2
 
 from ghci.clock import Clock, RealClock
+from ghci.colors import Palette, decide_color
 from ghci.gh import GhError, gh_api_download, gh_api_get, gh_api_graphql
 from ghci.ignore import IgnoreParseError, IgnoreRule, parse_ignore
 from ghci.logs import run_logs
@@ -69,7 +70,12 @@ def main(
         args = parser.parse_args(argv)
     except SystemExit as e:
         # argparse exits 2 on bad args, 0 on --help. Preserve.
+        # NB: argparse-generated error/help messages are NOT colored — the
+        # SystemExit fires before we can build a palette. Documented as a
+        # known limitation.
         return int(e.code) if e.code is not None else int(ExitCode.OK)
+
+    palette = Palette(decide_color(args.color, stderr=err))
 
     if args.subcommand is None:
         parser.print_help(file=err)
@@ -78,33 +84,34 @@ def main(
     try:
         if args.subcommand == "status":
             return _do_status(args, gh_get=gh_get, gh_graphql_fn=gh_graphql_fn,
-                              out=out, err=err)
+                              out=out, err=err, palette=palette)
         if args.subcommand == "watch":
             # Late import to avoid pulling watch deps when not needed.
             from ghci.watch.loop import run_watch
             return _do_watch(args, gh_get=gh_get, gh_graphql_fn=gh_graphql_fn,
-                             out=out, err=err, clock=clk, run_watch_fn=run_watch)
+                             out=out, err=err, clock=clk, run_watch_fn=run_watch,
+                             palette=palette)
         if args.subcommand == "logs":
             return _do_logs(args, gh_get=gh_get, gh_graphql_fn=gh_graphql_fn,
-                            gh_download_fn=gh_download_fn, err=err)
+                            gh_download_fn=gh_download_fn, err=err, palette=palette)
     except KeyboardInterrupt:
-        print("Interrupted", file=err)
+        print(palette.style("Interrupted", color="red"), file=err)
         return int(ExitCode.SIGINT)
     except EmptyTargetError as e:
-        print(str(e), file=err)
+        print(palette.style(str(e), color="red"), file=err)
         return int(ExitCode.BAD_ARGS)
     except FileNotFoundError as e:
-        print(f"gh: not found ({e})", file=err)
+        print(palette.style(f"gh: not found ({e})", color="red"), file=err)
         return int(ExitCode.GH_ERROR)
     except GhError as e:
-        print(f"gh: {e.stderr.strip()}", file=err)
+        print(palette.style(f"gh: {e.stderr.strip()}", color="red"), file=err)
         return int(ExitCode.GH_ERROR)
     except Exception as e:
         # Catch-all for unexpected errors (OSError, etc.). Print a clean,
         # one-line message — no traceback — and exit 1. KeyboardInterrupt
         # inherits from BaseException (not Exception), so it stays handled
         # above and won't be swallowed here.
-        print(f"gh-ci: unexpected error: {e}", file=err)
+        print(palette.style(f"gh-ci: unexpected error: {e}", color="red"), file=err)
         return int(ExitCode.UNEXPECTED)
 
     return int(ExitCode.UNEXPECTED)
@@ -113,13 +120,13 @@ def main(
 # Subcommand handlers =====
 
 
-def _do_status(args, *, gh_get, gh_graphql_fn, out, err) -> int:
-    target_result = _resolve_or_exit_2(args.target, gh_get=gh_get, err=err)
+def _do_status(args, *, gh_get, gh_graphql_fn, out, err, palette: Palette) -> int:
+    target_result = _resolve_or_exit_2(args.target, gh_get=gh_get, err=err, palette=palette)
     if isinstance(target_result, int):
         return target_result
     target = target_result
 
-    rules = _parse_rules_or_exit_2(args.ignore, err=err)
+    rules = _parse_rules_or_exit_2(args.ignore, err=err, palette=palette)
     if isinstance(rules, int):
         return rules
 
@@ -131,22 +138,23 @@ def _do_status(args, *, gh_get, gh_graphql_fn, out, err) -> int:
     pr_number = target.pr_number if isinstance(target, PrTarget) else None
     code, summary = evaluate_snapshot(
         items, pr_meta=pr_meta_rest, pr_number=pr_number, ignore_rules=rules,
+        palette=palette,
     )
     print(summary, file=out)
     return code
 
 
-def _do_watch(args, *, gh_get, gh_graphql_fn, out, err, clock, run_watch_fn) -> int:
-    target_result = _resolve_or_exit_2(args.target, gh_get=gh_get, err=err)
+def _do_watch(args, *, gh_get, gh_graphql_fn, out, err, clock, run_watch_fn, palette: Palette) -> int:
+    target_result = _resolve_or_exit_2(args.target, gh_get=gh_get, err=err, palette=palette)
     if isinstance(target_result, int):
         return target_result
     target = target_result
 
-    rules = _parse_rules_or_exit_2(args.ignore, err=err)
+    rules = _parse_rules_or_exit_2(args.ignore, err=err, palette=palette)
     if isinstance(rules, int):
         return rules
 
-    durations = _parse_durations_or_exit_2(args, err=err)
+    durations = _parse_durations_or_exit_2(args, err=err, palette=palette)
     if isinstance(durations, int):
         return durations
     interval, timeout, stalled_timeout = durations
@@ -161,18 +169,19 @@ def _do_watch(args, *, gh_get, gh_graphql_fn, out, err, clock, run_watch_fn) -> 
         stderr=err,
         gh_get=gh_get,
         gh_graphql_fn=gh_graphql_fn,
+        palette=palette,
     )
     print(summary, file=out)
     return code
 
 
-def _do_logs(args, *, gh_get, gh_graphql_fn, gh_download_fn, err) -> int:
-    target_result = _resolve_or_exit_2(args.target, gh_get=gh_get, err=err)
+def _do_logs(args, *, gh_get, gh_graphql_fn, gh_download_fn, err, palette: Palette) -> int:
+    target_result = _resolve_or_exit_2(args.target, gh_get=gh_get, err=err, palette=palette)
     if isinstance(target_result, int):
         return target_result
     target = target_result
 
-    rules = _parse_rules_or_exit_2(args.ignore, err=err)
+    rules = _parse_rules_or_exit_2(args.ignore, err=err, palette=palette)
     if isinstance(rules, int):
         return rules
 
@@ -186,6 +195,7 @@ def _do_logs(args, *, gh_get, gh_graphql_fn, gh_download_fn, err) -> int:
         gh_get=gh_get,
         gh_graphql_fn=gh_graphql_fn,
         gh_download_fn=gh_download_fn,
+        palette=palette,
     )
 
 
@@ -233,32 +243,32 @@ def _fetch_for_status(target, host, gh_get, gh_graphql_fn):
     return items, None
 
 
-def _resolve_or_exit_2(url, *, gh_get, err):
+def _resolve_or_exit_2(url, *, gh_get, err, palette: Palette):
     try:
         return resolve_target(url, gh_get=gh_get)
     except TargetParseError as e:
-        print(str(e), file=err)
+        print(palette.style(str(e), color="red"), file=err)
         return int(ExitCode.BAD_ARGS)
 
 
-def _parse_rules_or_exit_2(values, *, err):
+def _parse_rules_or_exit_2(values, *, err, palette: Palette):
     rules: list[IgnoreRule] = []
     for v in values or []:
         try:
             rules.append(parse_ignore(v))
         except IgnoreParseError as e:
-            print(str(e), file=err)
+            print(palette.style(str(e), color="red"), file=err)
             return int(ExitCode.BAD_ARGS)
     return rules
 
 
-def _parse_durations_or_exit_2(args, *, err):
+def _parse_durations_or_exit_2(args, *, err, palette: Palette):
     try:
         interval = _parse_duration("--interval", args.interval)
         timeout = _parse_duration("--timeout", args.timeout)
         stalled = _parse_duration("--stalled-timeout", args.stalled_timeout)
     except _BadDuration as e:
-        print(str(e), file=err)
+        print(palette.style(str(e), color="red"), file=err)
         return int(ExitCode.BAD_ARGS)
     return interval, timeout, stalled
 
@@ -298,6 +308,20 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
         epilog=_EXIT_CODE_HELP,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default=None,
+        help=(
+            "When to use color. Must appear BEFORE the subcommand "
+            "(e.g. `gh-ci --color=always watch <url>`). If omitted, "
+            "NO_COLOR / FORCE_COLOR env vars apply (any non-empty value, "
+            "including '0', enables/disables — per no-color.org / "
+            "force-color.org), then stderr TTY detection. Use "
+            "`--color=never` in scripts that pipe stdout — when stderr is "
+            "still a TTY, the default behavior colors stdout too."
+        ),
     )
     sub = parser.add_subparsers(dest="subcommand")
 

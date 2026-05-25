@@ -237,3 +237,196 @@ def test_format_summary_unknown_ignored_group_appears():
     )
     summary = format_summary([ignored], [ignored], result_line="Result: green")
     assert "Unknown (ignored by --ignore): weird" in summary
+
+
+# Color-aware tests =====
+
+
+from ghci.colors import Palette, _ResultStyle
+from ghci.conflicts import ConflictOutcome
+from ghci.status import _conflict_summary as _status_conflict_summary
+
+
+def test_result_line_colored_green_when_palette_enabled():
+    summary = format_summary(
+        [_item("t1")], [], result_line="Result: green",
+        result_style=_ResultStyle.GREEN, palette=Palette(True),
+    )
+    first_line = summary.splitlines()[0]
+    assert first_line.startswith("\033[1m\033[32m")
+    assert first_line.endswith("\033[0m")
+    assert "Result: green" in first_line
+
+
+def test_result_line_colored_red_for_no_productive_ci():
+    summary = format_summary(
+        [_item("t1", conclusion="skipped")], [],
+        result_line="Result: no productive CI ran",
+        result_style=_ResultStyle.RED, palette=Palette(True),
+    )
+    first_line = summary.splitlines()[0]
+    assert "\033[1m\033[31m" in first_line
+    assert "Result: no productive CI ran" in first_line
+
+
+def test_result_line_colored_yellow_for_in_progress():
+    summary = format_summary(
+        [_item("t1", status="in_progress", conclusion=None)], [],
+        result_line="Result: still in progress",
+        in_flight_label="In progress",
+        result_style=_ResultStyle.YELLOW, palette=Palette(True),
+    )
+    first_line = summary.splitlines()[0]
+    assert "\033[1m\033[33m" in first_line
+    assert "Result: still in progress" in first_line
+
+
+def test_result_line_colored_yellow_for_timeout():
+    summary = format_summary(
+        [_item("t1", status="in_progress", conclusion=None)], [],
+        result_line="Result: timeout reached while watching",
+        in_flight_label="In progress (timed out)",
+        result_style=_ResultStyle.YELLOW, palette=Palette(True),
+    )
+    first_line = summary.splitlines()[0]
+    assert "\033[1m\033[33m" in first_line
+
+
+def test_multi_line_result_colors_only_first_line():
+    multi = (
+        'Result: red CI (job "Build" failure)\n'
+        'To continue watching despite this failure: '
+        'gh-ci watch <target> --ignore job:"Build"'
+    )
+    summary = format_summary(
+        [_item("Build", conclusion="failure")], [],
+        result_line=multi,
+        in_flight_label="In progress",
+        result_style=_ResultStyle.RED, palette=Palette(True),
+    )
+    lines = summary.splitlines()
+    assert "\033[0m" in lines[0]
+    # Second line is byte-identical to the original input — no ANSI codes.
+    assert lines[1] == "To continue watching despite this failure: gh-ci watch <target> --ignore job:\"Build\""
+    assert "\033[" not in lines[1]
+
+
+def test_group_label_passed_colored_green_names_plain():
+    summary = format_summary(
+        [_item("t1")], [], result_line="Result: green",
+        result_style=_ResultStyle.GREEN, palette=Palette(True),
+    )
+    # Find the Passed line.
+    passed = next(l for l in summary.splitlines() if "Passed" in l)
+    # Label wrapped in green; the colon and names are not.
+    assert passed.startswith("\033[32mPassed\033[0m: t1")
+
+
+def test_group_label_failed_colored_red():
+    summary = format_summary(
+        [_item("Build", conclusion="failure")], [],
+        result_line='Result: red CI (job "Build" failure)',
+        in_flight_label="In progress",
+        result_style=_ResultStyle.RED, palette=Palette(True),
+    )
+    failed_line = next(l for l in summary.splitlines() if "Failed" in l)
+    assert failed_line.startswith("\033[31mFailed\033[0m: Build")
+
+
+def test_ignored_group_dimmed_even_when_base_style_is_red():
+    failed_item = _item("Lint", conclusion="failure")
+    summary = format_summary(
+        [failed_item], [failed_item], result_line="Result: green",
+        result_style=_ResultStyle.GREEN, palette=Palette(True),
+    )
+    line = next(l for l in summary.splitlines() if "ignored by --ignore" in l)
+    # Dim, NOT red — verifying ignored=True overrides base FAILED style.
+    assert line.startswith("\033[2mFailed (ignored by --ignore)\033[0m:")
+    assert "\033[31m" not in line.split(":")[0]
+
+
+def test_neutral_groups_dimmed():
+    summary = format_summary(
+        [_item("Lint", conclusion="skipped")], [], result_line="Result: green",
+        result_style=_ResultStyle.GREEN, palette=Palette(True),
+    )
+    skipped_line = next(l for l in summary.splitlines() if l.startswith("\033[2mSkipped"))
+    assert "Lint" in skipped_line
+
+
+def test_in_progress_group_yellow():
+    summary = format_summary(
+        [_item("Run", status="in_progress", conclusion=None)], [],
+        result_line="Result: still in progress",
+        in_flight_label="In progress",
+        result_style=_ResultStyle.YELLOW, palette=Palette(True),
+    )
+    line = next(l for l in summary.splitlines() if "In progress:" in l or "In progress\033" in l)
+    assert line.startswith("\033[33mIn progress\033[0m:")
+
+
+def test_conflict_summary_dirty_colored_red():
+    out = _status_conflict_summary(
+        ConflictOutcome.DIRTY, 42, palette=Palette(True),
+    )
+    lines = out.splitlines()
+    assert lines[0] == "\033[1m\033[31mResult: dirty\033[0m"
+    # Advice line plain.
+    assert "\033[" not in lines[1]
+
+
+def test_conflict_summary_unknown_colored_yellow():
+    out = _status_conflict_summary(
+        ConflictOutcome.UNKNOWN, 42, palette=Palette(True),
+    )
+    lines = out.splitlines()
+    assert lines[0] == "\033[1m\033[33mResult: unknown\033[0m"
+
+
+def test_conflict_summary_closed_colored_red():
+    out = _status_conflict_summary(
+        ConflictOutcome.CLOSED, 42, palette=Palette(True),
+    )
+    lines = out.splitlines()
+    assert lines[0].startswith("\033[1m\033[31m")
+    assert "Result: closed" in lines[0]
+
+
+def test_group_order_carries_valid_style():
+    from ghci.status import _GROUP_ORDER, _GroupStyle
+    for row in _GROUP_ORDER:
+        assert len(row) == 3
+        assert isinstance(row[2], _GroupStyle)
+
+
+def test_format_summary_byte_identical_when_palette_disabled():
+    # Backward-compat lock: the no-color path must be byte-identical to the
+    # pre-change rendering. A representative mixed input.
+    items = [
+        _item("t1"),
+        _item("t2", conclusion="failure"),
+        _item("t3", status="in_progress", conclusion=None),
+    ]
+    out = format_summary(
+        items, [], result_line='Result: red CI (job "t2" failure)',
+        in_flight_label="In progress",
+    )
+    # Exact-string assertion — must match what the codebase produced
+    # before this change.
+    assert out == (
+        'Result: red CI (job "t2" failure)\n'
+        'Passed: t1\n'
+        'Failed: t2\n'
+        'In progress: t3'
+    )
+
+
+def test_format_summary_no_color_with_result_style_none_unchanged():
+    # Even when palette is disabled but result_style is provided, the
+    # output is unchanged (result_style is a coloring directive, not a
+    # text transformation).
+    out = format_summary(
+        [_item("ok")], [], result_line="Result: green",
+        result_style=_ResultStyle.GREEN,
+    )
+    assert out == "Result: green\nPassed: ok"
