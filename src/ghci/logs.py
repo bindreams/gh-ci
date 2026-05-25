@@ -116,7 +116,7 @@ def run_logs(
             "filter": "failed" if failed_only else None,
             "run_id": run["run_id"],
             "run_url": run["run_url"],
-            "fetched_at_utc": nowdt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "fetched_at_utc": _format_utc(nowdt),
             "jobs": manifest_jobs,
         }
         manifest_path = run_dir / "manifest.json"
@@ -354,10 +354,24 @@ def _resolve_output_dir(custom: Path | None, *, err: TextIO) -> Path | None:
     return fallback
 
 
-def _run_subdir_name(run_id: int, when: datetime) -> str:
+def _to_utc(when: datetime) -> datetime:
+    """Normalize a datetime to tz-aware UTC.
+
+    Naive datetimes are assumed to be UTC (matching how the rest of this
+    module passes around `datetime.now(timezone.utc)`). Aware datetimes are
+    converted to UTC.
+    """
     when_utc = when if when.tzinfo else when.replace(tzinfo=timezone.utc)
-    when_utc = when_utc.astimezone(timezone.utc)
-    ts = when_utc.strftime("%Y-%m-%dT%H-%M-%SZ")
+    return when_utc.astimezone(timezone.utc)
+
+
+def _format_utc(when: datetime) -> str:
+    """Format `when` as an ISO-8601 UTC string with a trailing 'Z'."""
+    return _to_utc(when).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _run_subdir_name(run_id: int, when: datetime) -> str:
+    ts = _to_utc(when).strftime("%Y-%m-%dT%H-%M-%SZ")
     return f"gh-ci-{run_id}-{ts}"
 
 
