@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 import json
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -129,7 +129,10 @@ def test_manifest_schema(fake_gh, tmp_path):
     assert manifest["schema_version"] == 1
     assert manifest["target_kind"] == "job"
     assert manifest["run_id"] == 1000
-    assert "fetched_at_utc" in manifest
+    # NOW is a naive datetime (2026-05-25 14:30:00). Per Option A semantics,
+    # naive datetimes are assumed to be UTC, so the formatted value must
+    # match exactly — not just "contain 'Z'".
+    assert manifest["fetched_at_utc"] == "2026-05-25T14:30:00Z"
     j = manifest["jobs"][0]
     assert j["job_id"] == 55
     assert j["name"] == "Build"
@@ -141,6 +144,48 @@ def test_manifest_schema(fake_gh, tmp_path):
     assert j["bytes_written"] == 200
     assert j["error"] is None
     assert manifest["filter"] is None
+
+
+# Manifest fetched_at_utc handles tz-aware input =====
+
+
+def test_manifest_fetched_at_utc_converts_aware_datetime(fake_gh, tmp_path):
+    """Regression for bug #8: a tz-aware `now` (e.g. Berlin UTC+2) must be
+    converted to UTC before being formatted into `fetched_at_utc`. A naive
+    `nowdt.strftime("%Y-%m-%dT%H:%M:%SZ")` would have silently labeled the
+    local wall-clock time as UTC, which is incorrect."""
+    fake_gh.set_get(
+        "/repos/o/r/actions/jobs/55",
+        {"id": 55, "name": "Build", "status": "completed", "conclusion": "success",
+         "started_at": "S", "completed_at": "E", "html_url": "u", "run_id": 1000},
+    )
+    fake_gh.set_get(
+        "/repos/o/r/actions/runs/1000",
+        {"id": 1000, "name": "CI", "status": "completed"},
+    )
+    dl = FakeDownload()
+    dl.set_ok("/repos/o/r/actions/jobs/55/logs", b"x")
+
+    berlin = timezone(timedelta(hours=2))
+    now_berlin = datetime(2026, 5, 25, 14, 30, 0, tzinfo=berlin)
+
+    run_logs(
+        target=JobTarget(owner="o", repo="r", host="github.com",
+                         run_id=1000, job_id=55),
+        failed_only=False,
+        ignore_rules=[],
+        output_dir=tmp_path,
+        stderr=io.StringIO(),
+        gh_get=fake_gh.gh_get,
+        gh_download_fn=dl,
+        now=now_berlin,
+    )
+    subdir = next(tmp_path.iterdir())
+    manifest = json.loads((subdir / "manifest.json").read_text())
+    # 14:30 Berlin (UTC+2) == 12:30 UTC.
+    assert manifest["fetched_at_utc"] == "2026-05-25T12:30:00Z"
+    # The subdir name uses the same UTC normalization.
+    assert subdir.name == "gh-ci-1000-2026-05-25T12-30-00Z"
 
 
 # Run target with multiple jobs + --failed =====
