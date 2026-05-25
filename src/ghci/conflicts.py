@@ -17,7 +17,10 @@ def assess_pr(pr: dict) -> ConflictOutcome:
         return ConflictOutcome.CLOSED
 
     mergeable = pr.get("mergeable")
-    mergeable_state = (pr.get("mergeable_state") or "").lower()
+    mergeable_state = pr.get("mergeable_state")
+    if mergeable_state is None:
+        return ConflictOutcome.UNKNOWN
+    mergeable_state = mergeable_state.lower()
 
     if mergeable_state == "dirty":
         return ConflictOutcome.DIRTY
