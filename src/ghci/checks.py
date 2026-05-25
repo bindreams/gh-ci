@@ -302,6 +302,37 @@ def fetch_workflow_latest_run(
     return runs[0] if runs else None
 
 
+def fetch_workflow_latest_run_or_raise(
+    owner: str,
+    repo: str,
+    workflow_path: str,
+    *,
+    branch: str,
+    host: str | None = None,
+    gh_get: Callable[..., Any] = gh_api_get,
+) -> dict:
+    """Like fetch_workflow_latest_run but raises EmptyTargetError if no runs.
+
+    Used to convert the "recognized-but-empty" workflow target case into a
+    distinct error path (CLI exit 2) instead of silently returning empty
+    item lists that downstream code misclassifies as "no productive CI ran".
+    """
+    # Local import to avoid a module-level cycle: target.py imports gh, and
+    # checks.py is widely imported.
+    from ghci.target import EmptyTargetError
+
+    run = fetch_workflow_latest_run(
+        owner, repo, workflow_path, branch=branch, host=host, gh_get=gh_get,
+    )
+    if run is None:
+        raise EmptyTargetError(
+            f"Workflow {workflow_path!r} in {owner}/{repo} has no runs on "
+            f"branch {branch!r} (recognized target, but empty). "
+            f"Check the workflow filename and branch, or trigger a run."
+        )
+    return run
+
+
 def _job_dict_to_check_item(j: dict, *, workflow_name: str | None) -> CheckItem:
     return CheckItem(
         kind="actions",
