@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from enum import Enum
 
+from ghci.colors import _ResultStyle
+
 
 class ConflictOutcome(Enum):
     OK = "ok"
@@ -52,3 +54,19 @@ def message_for(outcome: ConflictOutcome, *, pr_number: int) -> str:
             # prefix). The caller is responsible for printing any target
             # context (resolution line, etc.) if needed.
             return "Mergeability still computing; retry with watch."
+
+
+def result_style_for(outcome: ConflictOutcome) -> _ResultStyle | None:
+    """Return the `Result:` line style for a conflict outcome.
+
+    RED for hard stops (closed / dirty / behind), YELLOW for the still-
+    computing UNKNOWN state, None for OK (no summary line is printed).
+    Shared by `status._conflict_summary` and `watch.loop._conflict_summary`.
+    """
+    match outcome:
+        case ConflictOutcome.OK:
+            return None
+        case ConflictOutcome.UNKNOWN:
+            return _ResultStyle.YELLOW
+        case ConflictOutcome.CLOSED | ConflictOutcome.DIRTY | ConflictOutcome.BEHIND:
+            return _ResultStyle.RED

@@ -286,3 +286,138 @@ def test_unexpected_oserror_exits_1_no_traceback(fake_gh):
     assert "unexpected" in stderr_value.lower()
     assert "disk full" in stderr_value
     assert "Traceback (most recent call last)" not in stderr_value
+
+
+# Color tests =====
+
+
+class _TtyStub(io.StringIO):
+    def isatty(self) -> bool:  # type: ignore[override]
+        return True
+
+
+def test_color_always_renders_red_error(fake_gh):
+    err = io.StringIO()
+    code = main(["--color=always", "status", "not a url"],
+                gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+                stderr=err)
+    assert code == 2
+    assert "\033[31m" in err.getvalue()
+
+
+def test_color_never_strips_color_even_with_tty_stderr(fake_gh):
+    err = _TtyStub()
+    code = main(["--color=never", "status", "not a url"],
+                gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+                stderr=err)
+    assert code == 2
+    assert "\033[" not in err.getvalue()
+
+
+def test_flag_omitted_no_color_env_disables(fake_gh, monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    err = _TtyStub()
+    code = main(["status", "not a url"],
+                gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+                stderr=err)
+    assert code == 2
+    assert "\033[" not in err.getvalue()
+
+
+def test_flag_omitted_force_color_enables_non_tty(fake_gh, monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    err = io.StringIO()  # non-TTY
+    code = main(["status", "not a url"],
+                gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+                stderr=err)
+    assert code == 2
+    assert "\033[31m" in err.getvalue()
+
+
+def test_flag_omitted_force_color_zero_enables_per_literal_spec(fake_gh, monkeypatch):
+    """FORCE_COLOR=0 enables (literal spec, matches Rich, diverges from Node)."""
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "0")
+    err = io.StringIO()
+    code = main(["status", "not a url"],
+                gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+                stderr=err)
+    assert code == 2
+    assert "\033[31m" in err.getvalue()
+
+
+def test_color_auto_with_no_color_env_disables_via_tty_check(fake_gh, monkeypatch):
+    """--color=auto bypasses NO_COLOR but still falls to TTY check (non-TTY → off)."""
+    monkeypatch.setenv("NO_COLOR", "1")
+    err = io.StringIO()  # non-TTY
+    code = main(["--color=auto", "status", "not a url"],
+                gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+                stderr=err)
+    assert code == 2
+    assert "\033[" not in err.getvalue()
+
+
+def test_color_auto_with_force_color_env_disables_via_tty_check(fake_gh, monkeypatch):
+    """--color=auto bypasses FORCE_COLOR; non-TTY stderr → no color."""
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    err = io.StringIO()  # non-TTY
+    code = main(["--color=auto", "status", "not a url"],
+                gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+                stderr=err)
+    assert code == 2
+    assert "\033[" not in err.getvalue()
+
+
+def test_color_auto_with_tty_enables(fake_gh, monkeypatch):
+    """--color=auto + TTY stderr enables, even when NO_COLOR=1 is set.
+
+    This is the strongest proof of the env-var bypass: a non-auto path
+    would see NO_COLOR=1 and disable; auto-mode skips env entirely.
+    """
+    monkeypatch.setenv("NO_COLOR", "1")  # bypassed by auto
+    err = _TtyStub()
+    code = main(["--color=auto", "status", "not a url"],
+                gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+                stderr=err)
+    assert code == 2
+    assert "\033[31m" in err.getvalue()
+
+
+def test_color_auto_with_tty_and_force_color_zero_still_enables(fake_gh, monkeypatch):
+    """Symmetric proof of the bypass: FORCE_COLOR=0 is ignored under auto."""
+    monkeypatch.setenv("FORCE_COLOR", "0")  # bypassed by auto
+    err = _TtyStub()
+    code = main(["--color=auto", "status", "not a url"],
+                gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+                stderr=err)
+    assert code == 2
+    assert "\033[31m" in err.getvalue()
+
+
+def test_flag_omitted_no_color_wins_over_force_color(fake_gh, monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    err = _TtyStub()
+    code = main(["status", "not a url"],
+                gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+                stderr=err)
+    assert code == 2
+    assert "\033[" not in err.getvalue()
+
+
+def test_argparse_error_not_colored(fake_gh, capsys):
+    """Documented limitation: SystemExit fires before palette is built.
+
+    argparse writes its own messages to the real sys.stderr (not the
+    injected stream, since parsing precedes palette construction). Capture
+    via capsys to assert no ANSI codes leaked.
+    """
+    code = main(["--color=always", "no-such-subcommand", "x"],
+                gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql)
+    assert code != 0
+    captured = capsys.readouterr()
+    assert "\033[" not in captured.err
+    assert "\033[" not in captured.out
