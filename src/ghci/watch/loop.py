@@ -123,6 +123,7 @@ def run_watch(
         now = clk.now()
         state, events, force_pushed = update_state(
             state, items, now=now, new_head_sha=new_head_sha,
+            ignore_rules=ignore_rules,
         )
 
         when = datetime.now()
@@ -358,8 +359,8 @@ def _evaluate_exit(
             # a period — and split it onto its own line.
             result_line = (
                 f'Result: required check stalled\n'
-                f'Required check "{stalled[0].name}" has not reported in '
-                f'{stalled_timeout:.0f}s — likely misconfigured.'
+                f'Required check "{stalled[0].name}" still unreported after '
+                f'{stalled_timeout:.0f}s with no CI progress — likely misconfigured.'
             )
             # S5: include still-in-flight non-ignored jobs.
             return 5, format_summary(

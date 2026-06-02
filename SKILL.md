@@ -40,5 +40,5 @@ Non-zero on any failure. Run `gh-ci <subcommand> --help` for the exact mapping. 
 
 ## Known limitations
 
-- Required-check stalled detection sees only required checks that GitHub surfaces in the rollup (including the `state == "expected"` "waiting to be reported" case). It does *not* catch checks that GitHub never lists at all.
+- Required-check stalled detection only fires once the whole run goes quiescent — no job *in progress* and no state change for the `--stalled-timeout` window — while a required check is still unreported. A check waiting on a *running* `needs:` upstream is *not* flagged. Caveat: an upstream that is only *queued* (not yet running) with nothing else active is treated as quiescent, so its downstream can still be flagged (gh-ci does not read the `needs:`-graph). It sees only checks GitHub surfaces in the rollup (including the `state == "expected"` "waiting to be reported" case); it does *not* catch checks that GitHub never lists at all.
 - Cancelled jobs (including supersede-by-newer-push cancellations) count as failures. Re-run on the fresh push if you hit this.

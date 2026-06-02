@@ -363,8 +363,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument(
         "--stalled-timeout", default="60s",
         help=(
-            "How long a required check can be in queued/expected/pending state "
-            "before exit 5 fires (default 60s)."
+            "How long the run may make no progress (no job running or changing "
+            "state) while a required check is still unreported before exit 5 "
+            "fires (default 60s)."
         ),
     )
 

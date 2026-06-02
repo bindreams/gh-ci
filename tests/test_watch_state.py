@@ -108,6 +108,26 @@ def test_force_push_resets_stalled_timers():
                                      ignore_rules=[])
 
 
+def test_force_push_anchors_quiescence_baseline_at_push_instant():
+    # The force-push tick anchors the run-quiescence baseline at the push
+    # instant, so a check still `expected` on the new SHA stalls at
+    # push_time + timeout — without needing a further poll to seed the
+    # baseline. (Pins the force-push `last_active` reset.)
+    item = _item("ci", kind="status_context", status="expected", required=True,
+                 workflow_name=None)
+    state = initial_state([item], head_sha="sha1")
+    state, _, _ = update_state(state, [item], now=0.0)
+    state, _, force_push = update_state(state, [item], now=100.0, new_head_sha="sha2")
+    assert force_push is True
+    assert state.last_active == 100.0
+    # At the boundary: not yet stalled.
+    assert not stalled_required_keys(state, now=160.0, stalled_timeout=60.0,
+                                     ignore_rules=[])
+    # Just past it: stalled, with no intervening poll needed to seed the baseline.
+    assert stalled_required_keys(state, now=161.0, stalled_timeout=60.0,
+                                 ignore_rules=[])
+
+
 def test_no_force_push_when_head_sha_unchanged():
     state = initial_state([_item("a", status="queued")], head_sha="sha1")
     _, _, force_push = update_state(state, [_item("a", status="queued")],
@@ -216,6 +236,105 @@ def test_timer_persists_across_ticks_if_check_still_not_started():
     state, _, _ = update_state(state, [item], now=61.0)
     assert stalled_required_keys(state, now=61.0, stalled_timeout=60.0,
                                  ignore_rules=[])
+
+
+def test_required_expected_not_stalled_while_another_job_in_progress():
+    # The reported false positive at the unit level: a needs:-gated required
+    # check sits in `expected` while an unrelated build runs. The run is making
+    # progress (build in_progress), so the expected check must NOT be flagged,
+    # however far past the per-check timeout we poll.
+    def snapshot():
+        return [
+            _item("Test (darwin)", kind="status_context", status="expected",
+                  required=True, workflow_name=None),
+            _item("Build (darwin)", status="in_progress", required=False),
+        ]
+
+    state = initial_state(snapshot())
+    for now in (10.0, 30.0, 60.0, 120.0, 600.0):
+        state, _, _ = update_state(state, snapshot(), now=now)
+        assert not stalled_required_keys(
+            state, now=now, stalled_timeout=60.0, ignore_rules=[]
+        )
+
+
+def test_run_quiescence_gate_releases_after_activity_stops():
+    # Once the run goes quiescent (build concluded, nothing in_progress and no
+    # events), the expected required check stalls — but only after the *run*
+    # has been quiescent for the timeout, measured from the last activity, not
+    # from when the check first appeared.
+    def snapshot(build_status, build_concl=None):
+        return [
+            _item("Test", kind="status_context", status="expected",
+                  required=True, workflow_name=None),
+            _item("Build", status=build_status, conclusion=build_concl,
+                  required=False),
+        ]
+
+    state = initial_state(snapshot("in_progress"))
+    state, _, _ = update_state(state, snapshot("in_progress"), now=10.0)  # active: level
+    state, events, _ = update_state(
+        state, snapshot("completed", "success"), now=20.0
+    )  # active: edge (conclude event)
+    assert any(e.kind == "concluded" for e in events)
+
+    # t=78: the check's own timer (started ~t=10) has exceeded 60s, but the run
+    # has only been quiescent for 58s (since the t=20 conclude). NOT stalled.
+    assert not stalled_required_keys(
+        state, now=78.0, stalled_timeout=60.0, ignore_rules=[]
+    )
+
+    # Keep polling a quiescent run — no activity resets the clock.
+    state, _, _ = update_state(state, snapshot("completed", "success"), now=78.0)
+    # t=85: quiescent for 65s (> 60). Now it stalls.
+    assert stalled_required_keys(
+        state, now=85.0, stalled_timeout=60.0, ignore_rules=[]
+    )
+
+
+def test_ignored_in_progress_job_does_not_keep_run_alive():
+    # --ignore removes a job from ALL consideration, liveness included: an
+    # ignored job's in_progress state must not suppress stall detection for an
+    # unrelated required check. A genuinely orphaned required check still
+    # stalls even while an ignored job runs.
+    def snapshot():
+        return [
+            _item("orphan", kind="status_context", status="expected",
+                  required=True, workflow_name=None),
+            _item("flaky", status="in_progress", required=False),
+        ]
+
+    rules = [IgnoreRule("job", "flaky")]
+    state = initial_state(snapshot())
+    for now in (10.0, 30.0, 60.0, 120.0):
+        state, _, _ = update_state(
+            state, snapshot(), now=now, ignore_rules=rules
+        )
+    assert stalled_required_keys(
+        state, now=120.0, stalled_timeout=60.0, ignore_rules=rules
+    )
+
+
+def test_queued_only_upstream_still_stalls_downstream_known_boundary():
+    # ACCEPTED BOUNDARY (no needs-graph): the liveness signal is "a job is
+    # in_progress". A downstream required check whose only upstream is still
+    # QUEUED (waiting for a runner), with nothing else in the run active, is
+    # treated as quiescent and flagged. Distinguishing this from a genuine
+    # orphan needs the workflow needs-graph; see README/SKILL "known
+    # limitations". Pinned here so the behavior can't change silently.
+    def snapshot():
+        return [
+            _item("downstream", kind="status_context", status="expected",
+                  required=True, workflow_name=None),
+            _item("upstream", status="queued", required=False),
+        ]
+
+    state = initial_state(snapshot())
+    for now in (10.0, 30.0, 60.0, 120.0):
+        state, _, _ = update_state(state, snapshot(), now=now)
+    assert stalled_required_keys(
+        state, now=120.0, stalled_timeout=60.0, ignore_rules=[]
+    )
 
 
 def test_not_started_statuses_contains_expected():

@@ -32,6 +32,12 @@ class WatchState:
     items_by_key: dict[CheckKey, CheckItem] = field(default_factory=dict)
     timer_starts: dict[CheckKey, float] = field(default_factory=dict)
     head_sha: str | None = None
+    # Wall-clock of the last poll at which the *run* showed forward progress —
+    # any non-ignored item in_progress (level) or any non-ignored started/
+    # concluded event (edge). Used to gate the stall verdict on whole-run
+    # quiescence rather than on a single check's not-started timer. None until
+    # the first update_state call.
+    last_active: float | None = None
 
 
 def initial_state(items: Iterable[CheckItem], *, head_sha: str | None = None) -> WatchState:
@@ -47,6 +53,7 @@ def update_state(
     *,
     now: float,
     new_head_sha: str | None = None,
+    ignore_rules: list[IgnoreRule] | None = None,
 ) -> tuple[WatchState, list[Event], bool]:
     """Diff state against new_items and return (new_state, events, force_pushed).
 
@@ -70,6 +77,11 @@ def update_state(
         for it in new_items:
             if _is_not_started(it):
                 next_state.timer_starts[_key(it)] = now
+        # Anchor the quiescence baseline at the force-push instant, so the
+        # post-push idle window is measured from here, not from the next poll.
+        # (Instant staleness is already prevented by the timer reseed above and
+        # by the loop skipping exit-evaluation on the force-push tick.)
+        next_state.last_active = now
         return next_state, [], True
 
     events: list[Event] = []
@@ -117,6 +129,33 @@ def update_state(
         if key not in new_keys:
             next_state.timer_starts.pop(key, None)
 
+    # Run-level liveness: the run is "active" this poll if any non-ignored item
+    # is currently in_progress (level signal — a slow build emits no events for
+    # its whole duration, so the level read is what keeps it alive) OR any
+    # non-ignored transition fired this poll (edge signal — an upstream
+    # concluding is progress even though nothing is in_progress for that
+    # instant). --ignore removes a job from all consideration, liveness
+    # included, so the same ignore-filtered view drives this gate and the
+    # stalled set. Carry the timestamp forward across quiescent polls; seed it
+    # on the first poll so quiescence is measured from when we started watching.
+    #
+    # Note: a check that flaps out of and back into the rollup reappears as a
+    # fresh item and re-emits a started/concluded event, counted as activity
+    # here. That can only delay a stall verdict, never manufacture a false one,
+    # so it is safe.
+    rules = ignore_rules or []
+    live_items = [it for it in new_items if not ignore_matches(it, rules)]
+    live_events = [e for e in events if not ignore_matches(e.item, rules)]
+    run_active = (
+        any(it.status == "in_progress" for it in live_items) or bool(live_events)
+    )
+    if run_active:
+        next_state.last_active = now
+    else:
+        next_state.last_active = (
+            state.last_active if state.last_active is not None else now
+        )
+
     return next_state, events, False
 
 
@@ -131,7 +170,17 @@ def stalled_required_keys(
     stalled_timeout: float,
     ignore_rules: list[IgnoreRule],
 ) -> list[CheckItem]:
-    """Return required checks whose stalled timer has exceeded stalled_timeout."""
+    """Return required checks that are stalled: not-started past the timer AND
+    the whole run quiescent for the timeout.
+
+    Gated on whole-run quiescence: while the run is making progress (any job
+    in_progress, or a state change within the timeout window) a not-started
+    required check is legitimately waiting (e.g. blocked on a needs: upstream),
+    not stalled. Only once the run has been quiescent for the full timeout do
+    we escalate.
+    """
+    if state.last_active is None or now - state.last_active <= stalled_timeout:
+        return []
     stalled: list[CheckItem] = []
     for key, start in state.timer_starts.items():
         item = state.items_by_key.get(key)

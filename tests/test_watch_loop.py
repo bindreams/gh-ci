@@ -199,6 +199,56 @@ def test_required_check_stalls(fake_gh):
     assert "stalled" in summary.lower() or "not reported" in summary.lower()
 
 
+def test_required_expected_not_stalled_while_upstream_build_runs(fake_gh):
+    # Reported false positive, end to end: a needs:-gated required check
+    # surfaces as an EXPECTED StatusContext and sits there for the whole
+    # upstream build (slow macOS runners). While the build is in_progress the
+    # run is making progress, so we must NOT exit 5 — we keep watching until
+    # the gated check reports.
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    building = _graphql_payload([
+        _status_context("Test hole (darwin/amd64)", state="EXPECTED", required=True),
+        _node("Build (darwin/amd64)", status="IN_PROGRESS", conclusion=None, db_id=1),
+    ])
+    done = _graphql_payload([
+        _status_context("Test hole (darwin/amd64)", state="SUCCESS", required=True),
+        _node("Build (darwin/amd64)", status="COMPLETED", conclusion="SUCCESS", db_id=1),
+    ])
+    # Build runs for many polls (well past the 30s stall window), then both the
+    # build and the gated check report green.
+    fake_gh.queue_graphql(*([building] * 12 + [done] * 6))
+    clock = FakeClock()
+    code, summary, _, _ = _run_watch_pr(
+        fake_gh, interval=5.0, stalled_timeout=30.0, clock=clock,
+    )
+    assert code == 0, summary
+    assert "stalled" not in summary.lower()
+    assert "Passed" in summary
+
+
+def test_orphan_required_stalls_after_run_goes_quiescent(fake_gh):
+    # The fix must still catch a genuinely orphaned required check: once the
+    # run goes quiescent (build done, nothing in_progress, nothing changing)
+    # with the check still unreported, exit 5 fires.
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    building = _graphql_payload([
+        _status_context("orphan", state="EXPECTED", required=True),
+        _node("build", status="IN_PROGRESS", conclusion=None, db_id=1),
+    ])
+    quiescent = _graphql_payload([
+        _status_context("orphan", state="EXPECTED", required=True),
+        _node("build", status="COMPLETED", conclusion="SUCCESS", db_id=1),
+    ])
+    fake_gh.queue_graphql(*([building] * 2 + [quiescent] * 40))
+    clock = FakeClock()
+    code, summary, _, _ = _run_watch_pr(
+        fake_gh, interval=5.0, stalled_timeout=30.0, clock=clock,
+    )
+    assert code == 5, summary
+    assert "Not reported (stalled): orphan" in summary
+    assert "Passed: build" in summary
+
+
 def test_ignored_failure_does_not_exit_3(fake_gh):
     fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
     fake_gh.queue_graphql(_graphql_payload([
@@ -373,9 +423,12 @@ def test_s2_stalled_message_quotes_name_and_uses_plan_wording(fake_gh):
         fake_gh, interval=5.0, stalled_timeout=60.0, clock=clock,
     )
     assert code == 5
-    # The plan substring must appear verbatim in the summary.
+    # The message must describe the actual trigger: the run went idle for the
+    # window with the check still unreported (not "this check hasn't reported
+    # in 60s" — it may have been unreported far longer).
     assert (
-        'Required check "ci/external" has not reported in 60s — likely misconfigured.'
+        'Required check "ci/external" still unreported after 60s with no CI '
+        'progress — likely misconfigured.'
         in summary
     )
     # Result line is the short label, not the long one.
@@ -398,16 +451,15 @@ def test_s5_red_exit_includes_in_progress_group(fake_gh):
 
 def test_s5_stalled_exit_includes_in_progress_group(fake_gh):
     fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
-    # Required EXPECTED context + a separate in-flight job that is not the
-    # stalled one.
-    nodes_stalled_plus_in_flight = [
+    # Required EXPECTED context that will stall once the run is quiescent, plus
+    # a separate non-required job still QUEUED — not the stalled check, and not
+    # in_progress (a running job would keep the run live and correctly suppress
+    # the stall). It must still surface under the in-flight "In progress" group.
+    nodes = [
         _status_context("ci/external", state="EXPECTED", required=True),
-        _node("other-job", status="IN_PROGRESS", conclusion=None, db_id=99),
+        _node("other-job", status="QUEUED", conclusion=None, required=False, db_id=99),
     ]
-    fake_gh.queue_graphql(*[
-        _graphql_payload(nodes_stalled_plus_in_flight)
-        for _ in range(100)
-    ])
+    fake_gh.queue_graphql(*[_graphql_payload(nodes) for _ in range(100)])
     clock = FakeClock()
     code, summary, _, _ = _run_watch_pr(
         fake_gh, interval=5.0, stalled_timeout=60.0, clock=clock,
