@@ -535,3 +535,55 @@ def test_fetch_pr_checks_paginates_check_suites():
     assert placeholders[0].name == "CI"
     assert len(fn.calls) == 2
     assert fn.calls[1]["variables"]["suiteCursor"] == "S2"
+
+
+def test_check_suites_not_reprocessed_while_contexts_paginate():
+    # Contexts need a 2nd page while suites finish on page 1. The page-1 suite
+    # must NOT be re-appended on page 2 (exactly one placeholder, no dup).
+    fn = _gh_graphql_returning(
+        _graphql_payload(
+            [_checkrun_actions_node(name="lint", db_id=1, run_id=100)],
+            has_next=True, end_cursor="P2",
+            suites=[_suite_node(status="QUEUED", run_db_id=200, workflow="CI")],
+        ),
+        _graphql_payload(
+            [_checkrun_actions_node(name="build", db_id=2, run_id=100)],
+            has_next=False,
+            suites=[_suite_node(status="QUEUED", run_db_id=200, workflow="CI")],
+        ),
+    )
+    items, _ = fetch_pr_checks("foo", "bar", 1, gh_graphql_fn=fn)
+    assert [i.name for i in items if not i.suite_placeholder] == ["lint", "build"]
+    placeholders = [it for it in items if it.suite_placeholder]
+    assert len(placeholders) == 1
+    assert placeholders[0].name == "CI"
+    assert len(fn.calls) == 2
+
+
+def test_suite_node_missing_optional_fields_yields_placeholder_without_raising():
+    # Defensive: a suite dict missing app/checkRuns and with workflow=None must
+    # still yield a placeholder named "GitHub Actions workflow", not raise.
+    payload = {
+        "repository": {"pullRequest": {
+            "state": "OPEN", "mergeable": "MERGEABLE", "headRefOid": "abc1234",
+            "commits": {"nodes": [{"commit": {
+                "statusCheckRollup": {"contexts": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": "X"},
+                    "nodes": [],
+                }},
+                "checkSuites": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [{"status": "QUEUED",
+                               "workflowRun": {"databaseId": 200, "url": "u",
+                                               "workflow": None}}],
+                },
+            }}]},
+        }}
+    }
+    fn = _gh_graphql_returning(payload)
+    items, _ = fetch_pr_checks("foo", "bar", 1, gh_graphql_fn=fn)
+    placeholders = [it for it in items if it.suite_placeholder]
+    assert len(placeholders) == 1
+    assert placeholders[0].name == "GitHub Actions workflow"
+    assert placeholders[0].workflow_name is None
+    assert placeholders[0].run_id == 200
