@@ -235,6 +235,12 @@ def _resolve_runs_for_target(
     for item in items:
         if item.kind != "actions" or item.run_id is None:
             continue
+        if item.suite_placeholder:
+            # Synthetic check-suite placeholder: a queued/failed run with no
+            # job check runs. It carries a real run_id but has no logs to
+            # download; once the run produces jobs, those real items drive
+            # collection here. Skip it so `logs` behavior is unchanged.
+            continue
         if item.run_id in seen:
             continue
         seen.add(item.run_id)

@@ -783,3 +783,76 @@ def test_output_dir_error_red_when_palette_enabled(tmp_path):
     result = _resolve_output_dir(blocker / "sub", err=err, palette=Palette(True))
     assert result is None
     assert err.getvalue().startswith("\033[31m--output-dir: cannot create")
+
+
+# PR target — suite placeholder exclusion =====
+
+
+def test_pr_target_skips_queued_suite_placeholder(fake_gh, tmp_path):
+    """A queued Actions check suite with no jobs surfaces as a synthetic
+    placeholder in fetch_pr_checks (for the status/watch gate), carrying a real
+    run_id. `logs` must NOT fetch that run — it has no jobs/logs — only runs
+    that actually produced check runs."""
+    fake_gh.queue_graphql({
+        "repository": {"pullRequest": {
+            "state": "OPEN", "mergeable": "MERGEABLE", "headRefOid": "sha",
+            "commits": {"nodes": [{"commit": {
+                "statusCheckRollup": {"contexts": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [{
+                        "__typename": "CheckRun",
+                        "name": "build", "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                        "detailsUrl": "https://github.com/o/r/runs/1",
+                        "isRequired": False, "databaseId": 1,
+                        "checkSuite": {"workflowRun": {
+                            "databaseId": 999,
+                            "url": "https://github.com/o/r/actions/runs/999",
+                            "workflow": {"name": "CI"}}},
+                    }],
+                }},
+                "checkSuites": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [
+                        {"status": "COMPLETED", "conclusion": "SUCCESS",
+                         "app": {"slug": "github-actions"},
+                         "checkRuns": {"totalCount": 1},
+                         "workflowRun": {"databaseId": 999, "url": "u",
+                                         "workflow": {"name": "CI"}}},
+                        {"status": "QUEUED", "conclusion": None,
+                         "app": {"slug": "github-actions"},
+                         "checkRuns": {"totalCount": 0},
+                         "workflowRun": {"databaseId": 200, "url": "u",
+                                         "workflow": {"name": "Slow"}}},
+                    ],
+                },
+            }}]},
+        }},
+    })
+    fake_gh.set_get("/repos/o/r/actions/runs/999",
+                    {"id": 999, "name": "CI", "status": "completed",
+                     "html_url": "https://github.com/o/r/actions/runs/999"})
+    fake_gh.set_get("/repos/o/r/actions/runs/999/jobs",
+                    {"jobs": [{"id": 77, "name": "build", "status": "completed",
+                               "conclusion": "success", "started_at": "S",
+                               "completed_at": "E", "html_url": "u", "run_id": 999}]})
+    dl = FakeDownload()
+    dl.set_ok("/repos/o/r/actions/jobs/77/logs", b"build log content")
+
+    # The placeholder run 200 must never be fetched.
+    def gh_get_guard(path, *, host=None, paginate=False):
+        if "/actions/runs/200" in path:
+            raise AssertionError(
+                "queued-suite placeholder run 200 must not be fetched for logs"
+            )
+        return fake_gh.gh_get(path, host=host, paginate=paginate)
+
+    code = run_logs(
+        target=PrTarget(owner="o", repo="r", host="github.com", pr_number=42),
+        failed_only=False, ignore_rules=[], output_dir=tmp_path,
+        stderr=io.StringIO(), gh_get=gh_get_guard,
+        gh_graphql_fn=fake_gh.gh_graphql, gh_download_fn=dl, now=NOW,
+    )
+    assert code == 0
+    subdirs = list(tmp_path.iterdir())
+    assert {s.name for s in subdirs} == {"gh-ci-999-2026-05-25T14-30-00Z"}
