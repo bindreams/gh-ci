@@ -508,6 +508,21 @@ def test_ignored_workflow_placeholder_does_not_gate_green():
     assert "In progress (ignored by --ignore): CI" in summary
 
 
+def test_suite_pending_group_yellow():
+    summary = format_summary(
+        [CheckItem(kind="actions", name="CI", workflow_name="CI",
+                   status="queued", conclusion=None, url=None, required=False,
+                   check_run_id=None, run_id=200, workflow_run_url=None,
+                   suite_placeholder=True)],
+        [], result_line="Result: still in progress",
+        in_flight_label="In progress",
+        result_style=_ResultStyle.YELLOW, palette=Palette(True),
+    )
+    line = next(l for l in summary.splitlines() if "no jobs reported yet" in l)
+    assert line.startswith("\033[33mIn progress (no jobs reported yet)\033[0m:")
+    assert "CI" in line
+
+
 def test_failed_suite_placeholder_reported_red_not_pending():
     # A red suite placeholder (status completed, failed conclusion) must render
     # under its conclusion group, NOT the "no jobs reported yet" group.

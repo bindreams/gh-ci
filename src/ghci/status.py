@@ -195,8 +195,9 @@ def format_summary(
         if it.suite_placeholder and it.status != "completed"
     ]
     if suite_pending_names:
-        groups["In progress (no jobs reported yet)"] = _GroupSpec(
-            label="In progress (no jobs reported yet)",
+        suite_pending_label = "In progress (no jobs reported yet)"
+        groups[suite_pending_label] = _GroupSpec(
+            label=suite_pending_label,
             names=suite_pending_names,
             style=_GroupStyle.IN_FLIGHT,
         )
