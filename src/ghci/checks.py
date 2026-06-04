@@ -23,6 +23,7 @@ class CheckItem:
     check_run_id: int | None
     run_id: int | None
     workflow_run_url: str | None
+    suite_placeholder: bool = False
 
 
 class Outcome(Enum):
@@ -53,7 +54,7 @@ def classify_conclusion(conclusion: str | None) -> Outcome | None:
 # GraphQL =====
 
 _PR_QUERY = """
-query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {
+query($owner:String!, $repo:String!, $number:Int!, $cursor:String, $suiteCursor:String) {
   repository(owner:$owner, name:$repo) {
     pullRequest(number:$number) {
       state
@@ -86,6 +87,20 @@ query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {
                 }
               }
             }
+            checkSuites(first:100, after:$suiteCursor) {
+              pageInfo { hasNextPage endCursor }
+              nodes {
+                status
+                conclusion
+                app { slug }
+                checkRuns { totalCount }
+                workflowRun {
+                  databaseId
+                  url
+                  workflow { name }
+                }
+              }
+            }
           }
         }
       }
@@ -108,16 +123,21 @@ def fetch_pr_checks(
     Returns (items, pr_meta) where pr_meta has {state, mergeable, headRefOid}.
     """
     items: list[CheckItem] = []
-    cursor: str | None = None
+    suite_nodes: list[dict] = []
     meta: dict[str, Any] = {}
-    while True:
+    ctx_cursor: str | None = None
+    suite_cursor: str | None = None
+    ctx_done = False
+    suite_done = False
+    while not (ctx_done and suite_done):
         data = gh_graphql_fn(
             _PR_QUERY,
             host=host,
             owner=owner,
             repo=repo,
             number=pr_number,
-            cursor=cursor,
+            cursor=ctx_cursor,
+            suiteCursor=suite_cursor,
         )
         pr = data["repository"]["pullRequest"]
         if not meta:
@@ -129,17 +149,101 @@ def fetch_pr_checks(
         commit_nodes = pr.get("commits", {}).get("nodes", [])
         if not commit_nodes:
             break
-        rollup = commit_nodes[0]["commit"].get("statusCheckRollup")
+        commit = commit_nodes[0]["commit"]
+
+        if not suite_done:
+            suites = commit.get("checkSuites") or {}
+            for node in suites.get("nodes", []) or []:
+                suite_nodes.append(node)
+            spage = suites.get("pageInfo") or {}
+            if spage.get("hasNextPage"):
+                suite_cursor = spage.get("endCursor")
+            else:
+                suite_done = True
+
+        rollup = commit.get("statusCheckRollup")
         if rollup is None:
-            break
-        contexts = rollup.get("contexts", {})
-        for node in contexts.get("nodes", []) or []:
-            items.append(_node_to_check_item(node))
-        page = contexts.get("pageInfo", {})
-        if not page.get("hasNextPage"):
-            break
-        cursor = page.get("endCursor")
+            ctx_done = True
+        elif not ctx_done:
+            contexts = rollup.get("contexts", {})
+            for node in contexts.get("nodes", []) or []:
+                items.append(_node_to_check_item(node))
+            cpage = contexts.get("pageInfo", {})
+            if cpage.get("hasNextPage"):
+                ctx_cursor = cpage.get("endCursor")
+            else:
+                ctx_done = True
+
+    items.extend(_synthesize_suite_placeholders(suite_nodes))
     return items, meta
+
+
+# A check suite is non-terminal unless its status is "completed". A completed
+# suite that produced zero check runs is normally a no-op (success / skipped),
+# but a *failed* one would be invisible to a contexts-only verdict.
+_TERMINAL_SUITE_STATUS = "completed"
+
+
+def _synthesize_suite_placeholders(suite_nodes: list[dict]) -> list[CheckItem]:
+    """Placeholders for Actions check suites whose jobs are missing from the
+    rollup contexts.
+
+    statusCheckRollup.contexts lists only *created* check runs, so a suite that
+    has produced zero check runs is invisible there. Two cases matter:
+
+    * non-terminal suite (queued / in_progress) with no check runs -> an
+      in-flight placeholder, forcing "still in progress" instead of a false
+      green (the hole#440 bug);
+    * terminal suite whose conclusion is a failure with no check runs -> a red
+      placeholder, so a startup-failed workflow can't hide behind a green
+      sibling.
+
+    A suite that has already produced check runs (totalCount > 0) is covered by
+    those contexts, so no placeholder is made. Third-party app suites with no
+    workflow run (renovate, cirun-application) sit QUEUED with zero check runs
+    forever and are excluded, so they never wedge a PR as perpetually pending.
+    """
+    placeholders: list[CheckItem] = []
+    for suite in suite_nodes:
+        runs = (suite.get("checkRuns") or {}).get("totalCount") or 0
+        if runs > 0:
+            continue  # jobs exist -> already represented in statusCheckRollup.contexts
+        wf_run = suite.get("workflowRun")
+        app = suite.get("app") or {}
+        is_actions = wf_run is not None or app.get("slug") == "github-actions"
+        if not is_actions:
+            continue
+        status = str(suite.get("status") or "").lower()
+        conclusion = _lower_or_none(suite.get("conclusion"))
+        if status == _TERMINAL_SUITE_STATUS:
+            # Only failed terminal suites need surfacing; success / skipped /
+            # neutral zero-run suites are genuine no-ops.
+            if classify_conclusion(conclusion) != Outcome.FAILED:
+                continue
+            item_status = _TERMINAL_SUITE_STATUS
+            item_conclusion = conclusion
+        else:
+            item_status = status or "queued"
+            item_conclusion = None
+        wf_run = wf_run or {}
+        workflow = wf_run.get("workflow") or {}
+        wf_name = workflow.get("name")
+        placeholders.append(
+            CheckItem(
+                kind="actions",
+                name=wf_name or "GitHub Actions workflow",
+                workflow_name=wf_name,
+                status=item_status,
+                conclusion=item_conclusion,
+                url=wf_run.get("url"),
+                required=False,
+                check_run_id=None,
+                run_id=wf_run.get("databaseId"),
+                workflow_run_url=wf_run.get("url"),
+                suite_placeholder=True,
+            )
+        )
+    return placeholders
 
 
 def _node_to_check_item(node: dict) -> CheckItem:

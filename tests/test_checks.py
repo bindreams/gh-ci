@@ -42,33 +42,48 @@ def test_classify_unknown_string_is_none():
 
 
 def _graphql_payload(nodes, *, has_next=False, end_cursor="X", pr_state="OPEN",
-                     head_sha="abc1234"):
+                     head_sha="abc1234", suites=None, suites_has_next=False,
+                     suites_end_cursor="S2"):
+    commit = {
+        "statusCheckRollup": {
+            "contexts": {
+                "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor},
+                "nodes": nodes,
+            }
+        }
+    }
+    if suites is not None:
+        commit["checkSuites"] = {
+            "pageInfo": {"hasNextPage": suites_has_next, "endCursor": suites_end_cursor},
+            "nodes": suites,
+        }
     return {
         "repository": {
             "pullRequest": {
                 "state": pr_state,
                 "mergeable": "MERGEABLE",
                 "headRefOid": head_sha,
-                "commits": {
-                    "nodes": [
-                        {
-                            "commit": {
-                                "statusCheckRollup": {
-                                    "contexts": {
-                                        "pageInfo": {
-                                            "hasNextPage": has_next,
-                                            "endCursor": end_cursor,
-                                        },
-                                        "nodes": nodes,
-                                    }
-                                }
-                            }
-                        }
-                    ]
-                },
+                "commits": {"nodes": [{"commit": commit}]},
             }
         }
     }
+
+
+def _suite_node(*, status="QUEUED", conclusion=None, app_slug="github-actions",
+                run_db_id=200, workflow="CI", with_workflow_run=True, runs=0):
+    node = {
+        "status": status,
+        "conclusion": conclusion,
+        "app": {"slug": app_slug},
+        "checkRuns": {"totalCount": runs},
+    }
+    node["workflowRun"] = (
+        {"databaseId": run_db_id,
+         "url": f"https://github.com/foo/bar/actions/runs/{run_db_id}",
+         "workflow": {"name": workflow}}
+        if with_workflow_run else None
+    )
+    return node
 
 
 def _checkrun_actions_node(name="lint", status="COMPLETED", conclusion="SUCCESS",
@@ -353,3 +368,170 @@ def test_fetch_workflow_latest_run_empty_returns_none():
         "foo", "bar", "ci.yml", branch="main", gh_get=gh_get
     )
     assert run is None
+
+
+# fetch_pr_checks — pending check-suite placeholders =====
+
+
+def test_placeholder_synthesized_for_queued_actions_suite_with_no_jobs():
+    # Reproduces hole#440: a fast check is done (in contexts) while a real CI
+    # run is queued with zero job check runs (only present as a check suite).
+    fn = _gh_graphql_returning(_graphql_payload(
+        [_checkrun_actions_node(name="Validate PR title", workflow="Semantic PR Title",
+                                run_id=100, db_id=1)],
+        suites=[
+            _suite_node(status="COMPLETED", conclusion="SUCCESS", run_db_id=100,
+                        workflow="Semantic PR Title", runs=1),
+            _suite_node(status="QUEUED", run_db_id=200, workflow="CI", runs=0),
+        ],
+    ))
+    items, _ = fetch_pr_checks("foo", "bar", 1, gh_graphql_fn=fn)
+    placeholders = [it for it in items if it.suite_placeholder]
+    assert len(placeholders) == 1
+    p = placeholders[0]
+    assert p.kind == "actions"
+    assert p.name == "CI"
+    assert p.workflow_name == "CI"
+    assert p.status == "queued"
+    assert p.conclusion is None
+    assert p.run_id == 200
+    assert p.required is False
+
+
+def test_no_placeholder_for_third_party_zombie_suite():
+    # renovate / cirun-application: queued forever, zero runs, no workflowRun.
+    fn = _gh_graphql_returning(_graphql_payload(
+        [_checkrun_actions_node(name="lint", run_id=100)],
+        suites=[
+            _suite_node(status="QUEUED", app_slug="renovate", with_workflow_run=False),
+            _suite_node(status="QUEUED", app_slug="cirun-application",
+                        with_workflow_run=False),
+            _suite_node(status="COMPLETED", conclusion="SUCCESS", run_db_id=100, runs=1),
+        ],
+    ))
+    items, _ = fetch_pr_checks("foo", "bar", 1, gh_graphql_fn=fn)
+    assert [it for it in items if it.suite_placeholder] == []
+
+
+def test_no_placeholder_for_completed_actions_suite():
+    fn = _gh_graphql_returning(_graphql_payload(
+        [_checkrun_actions_node(name="lint", run_id=100)],
+        suites=[_suite_node(status="COMPLETED", conclusion="SUCCESS", run_db_id=100,
+                            runs=1)],
+    ))
+    items, _ = fetch_pr_checks("foo", "bar", 1, gh_graphql_fn=fn)
+    assert [it for it in items if it.suite_placeholder] == []
+
+
+def test_no_placeholder_when_suite_already_produced_jobs():
+    # The CI run's jobs are already reporting (totalCount > 0) → the existing
+    # contexts logic covers it; no placeholder needed.
+    fn = _gh_graphql_returning(_graphql_payload(
+        [_checkrun_actions_node(name="Build", status="IN_PROGRESS",
+                                conclusion=None, run_id=200, db_id=5)],
+        suites=[_suite_node(status="IN_PROGRESS", run_db_id=200, workflow="CI",
+                            runs=1)],
+    ))
+    items, _ = fetch_pr_checks("foo", "bar", 1, gh_graphql_fn=fn)
+    assert [it for it in items if it.suite_placeholder] == []
+
+
+def test_placeholder_when_rollup_null_but_actions_suite_queued():
+    # Brand-new PR: no rollup contexts yet, but a queued CI suite already exists.
+    payload = {
+        "repository": {"pullRequest": {
+            "state": "OPEN", "mergeable": "UNKNOWN", "headRefOid": "deadbeef",
+            "commits": {"nodes": [{"commit": {
+                "statusCheckRollup": None,
+                "checkSuites": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [_suite_node(status="QUEUED", run_db_id=200, workflow="CI")],
+                },
+            }}]},
+        }}
+    }
+    fn = _gh_graphql_returning(payload)
+    items, _ = fetch_pr_checks("foo", "bar", 1, gh_graphql_fn=fn)
+    assert len(items) == 1
+    assert items[0].suite_placeholder is True
+    assert items[0].name == "CI"
+
+
+def test_placeholder_for_github_actions_suite_without_workflow_run():
+    # Defensive: if a queued github-actions suite is not yet linked to a
+    # workflowRun, the app slug still identifies it as real Actions work.
+    fn = _gh_graphql_returning(_graphql_payload(
+        [_checkrun_actions_node(name="lint", run_id=100)],
+        suites=[
+            _suite_node(status="QUEUED", app_slug="github-actions",
+                        with_workflow_run=False),
+            _suite_node(status="COMPLETED", conclusion="SUCCESS", run_db_id=100, runs=1),
+        ],
+    ))
+    items, _ = fetch_pr_checks("foo", "bar", 1, gh_graphql_fn=fn)
+    placeholders = [it for it in items if it.suite_placeholder]
+    assert len(placeholders) == 1
+    assert placeholders[0].name == "GitHub Actions workflow"
+    assert placeholders[0].run_id is None
+
+
+def test_failed_suite_with_no_jobs_becomes_red_placeholder():
+    # A startup-failed workflow that never created check runs must surface as
+    # red, not hide behind a green sibling.
+    fn = _gh_graphql_returning(_graphql_payload(
+        [_checkrun_actions_node(name="Validate PR title", workflow="Semantic PR Title",
+                                run_id=100, db_id=1)],
+        suites=[
+            _suite_node(status="COMPLETED", conclusion="SUCCESS", run_db_id=100,
+                        workflow="Semantic PR Title", runs=1),
+            _suite_node(status="COMPLETED", conclusion="STARTUP_FAILURE",
+                        run_db_id=200, workflow="CI", runs=0),
+        ],
+    ))
+    items, _ = fetch_pr_checks("foo", "bar", 1, gh_graphql_fn=fn)
+    placeholders = [it for it in items if it.suite_placeholder]
+    assert len(placeholders) == 1
+    p = placeholders[0]
+    assert p.name == "CI"
+    assert p.status == "completed"
+    assert p.conclusion == "startup_failure"
+
+
+def test_succeeded_or_skipped_suite_with_no_jobs_is_no_op():
+    # A completed suite that produced zero check runs but did NOT fail
+    # (success / skipped via path filter) must not create a placeholder.
+    fn = _gh_graphql_returning(_graphql_payload(
+        [_checkrun_actions_node(name="lint", run_id=100)],
+        suites=[
+            _suite_node(status="COMPLETED", conclusion="SUCCESS", run_db_id=100, runs=1),
+            _suite_node(status="COMPLETED", conclusion="SKIPPED", run_db_id=300,
+                        workflow="Optional", runs=0),
+            _suite_node(status="COMPLETED", conclusion="SUCCESS", run_db_id=400,
+                        workflow="NoOp", runs=0),
+        ],
+    ))
+    items, _ = fetch_pr_checks("foo", "bar", 1, gh_graphql_fn=fn)
+    assert [it for it in items if it.suite_placeholder] == []
+
+
+def test_fetch_pr_checks_paginates_check_suites():
+    # Check suites must be fully paginated — a queued Actions suite on page 2
+    # must still be discovered (no arbitrary first:100 cap).
+    fn = _gh_graphql_returning(
+        _graphql_payload(
+            [_checkrun_actions_node(name="lint", run_id=100)],
+            suites=[_suite_node(status="COMPLETED", conclusion="SUCCESS", run_db_id=100,
+                                workflow="Semantic PR Title", runs=1)],
+            suites_has_next=True, suites_end_cursor="S2",
+        ),
+        _graphql_payload(
+            [],  # contexts already exhausted on page 1
+            suites=[_suite_node(status="QUEUED", run_db_id=200, workflow="CI")],
+        ),
+    )
+    items, _ = fetch_pr_checks("foo", "bar", 1, gh_graphql_fn=fn)
+    placeholders = [it for it in items if it.suite_placeholder]
+    assert len(placeholders) == 1
+    assert placeholders[0].name == "CI"
+    assert len(fn.calls) == 2
+    assert fn.calls[1]["variables"]["suiteCursor"] == "S2"
