@@ -176,6 +176,7 @@ def format_summary(
             for it in active
             if it.status != "completed"
             and classify_conclusion(it.conclusion) is None
+            and not it.suite_placeholder
             and (it.kind, it.name, it.workflow_name) not in stalled_keys
         ]
         if in_flight_names:
@@ -183,6 +184,22 @@ def format_summary(
                 label=in_flight_label, names=in_flight_names,
                 style=_GroupStyle.IN_FLIGHT,
             )
+
+    # Actions workflow runs whose check suite exists but has not reported any
+    # jobs yet (queued runs). Surfaced as a distinct group so the agent sees
+    # which workflow is still pending and why the PR is not green. Failed suite
+    # placeholders (status "completed") are excluded — they ride the normal
+    # conclusion groups (e.g. "Startup failure").
+    suite_pending_names = [
+        it.name for it in active
+        if it.suite_placeholder and it.status != "completed"
+    ]
+    if suite_pending_names:
+        groups["In progress (no jobs reported yet)"] = _GroupSpec(
+            label="In progress (no jobs reported yet)",
+            names=suite_pending_names,
+            style=_GroupStyle.IN_FLIGHT,
+        )
 
     # S6: terminal items whose conclusion isn't None and isn't in the known
     # group set would otherwise vanish from the summary. This covers both

@@ -430,3 +430,96 @@ def test_format_summary_no_color_with_result_style_none_unchanged():
         result_style=_ResultStyle.GREEN,
     )
     assert out == "Result: green\nPassed: ok"
+
+
+# suite_placeholder tests =====
+
+
+def _placeholder(name="CI", *, status="queued", workflow_name="CI"):
+    return CheckItem(
+        kind="actions", name=name, workflow_name=workflow_name,
+        status=status, conclusion=None, url=None, required=False,
+        check_run_id=None, run_id=200, workflow_run_url=None,
+        suite_placeholder=True,
+    )
+
+
+def test_pending_suite_forces_in_progress_not_green():
+    # hole#440 reproduction: one fast check passed, CI workflow still queued
+    # with no jobs. Must be "still in progress" (exit 7), never green.
+    items = [_item("Validate PR title", workflow_name="Semantic PR Title"),
+             _placeholder("CI")]
+    pr = {"state": "open", "mergeable": True, "mergeable_state": "clean"}
+    code, summary = evaluate_snapshot(items, pr_meta=pr, pr_number=440, ignore_rules=[])
+    assert code == 7
+    assert "still in progress" in summary.lower()
+    assert "Passed: Validate PR title" in summary
+    assert "In progress (no jobs reported yet): CI" in summary
+
+
+def test_pending_suite_separate_from_generic_in_progress_group():
+    items = [_placeholder("CI"),
+             _item("Build", status="in_progress", conclusion=None)]
+    pr = {"state": "open", "mergeable": True, "mergeable_state": "clean"}
+    code, summary = evaluate_snapshot(items, pr_meta=pr, pr_number=1, ignore_rules=[])
+    assert code == 7
+    # The real running job is in the generic group; the queued workflow is in
+    # its own group. "CI" must NOT appear in the generic "In progress:" line.
+    in_progress_line = next(
+        l for l in summary.splitlines() if l.startswith("In progress:")
+    )
+    assert "Build" in in_progress_line
+    assert "CI" not in in_progress_line
+    assert "In progress (no jobs reported yet): CI" in summary
+
+
+def test_pending_suite_only_has_no_generic_in_progress_line():
+    # When the ONLY in-flight item is a placeholder, the generic "In progress:"
+    # group must be absent — locks the `not it.suite_placeholder` filter.
+    items = [_placeholder("CI")]
+    pr = {"state": "open", "mergeable": True, "mergeable_state": "clean"}
+    code, summary = evaluate_snapshot(items, pr_meta=pr, pr_number=1, ignore_rules=[])
+    assert code == 7
+    assert "no productive" not in summary.lower()
+    assert "In progress (no jobs reported yet): CI" in summary
+    assert not any(l.startswith("In progress:") for l in summary.splitlines())
+
+
+def test_failure_takes_precedence_over_pending_suite():
+    # A real red plus a still-queued workflow → red wins (exit 3), not pending.
+    items = [_item("bad", conclusion="failure"), _placeholder("CI")]
+    pr = {"state": "open", "mergeable": True, "mergeable_state": "clean"}
+    code, summary = evaluate_snapshot(items, pr_meta=pr, pr_number=1, ignore_rules=[])
+    assert code == 3
+    assert "Failed: bad" in summary
+
+
+def test_ignored_workflow_placeholder_does_not_gate_green():
+    # The user's escape hatch from a wedged-pending PR: --ignore workflow:CI
+    # drops the queued CI workflow from the gate, so the rest can go green.
+    items = [_item("Validate PR title", workflow_name="Semantic PR Title"),
+             _placeholder("CI")]
+    pr = {"state": "open", "mergeable": True, "mergeable_state": "clean"}
+    code, summary = evaluate_snapshot(
+        items, pr_meta=pr, pr_number=1,
+        ignore_rules=[IgnoreRule("workflow", "CI")],
+    )
+    assert code == 0
+    assert "In progress (ignored by --ignore): CI" in summary
+
+
+def test_failed_suite_placeholder_reported_red_not_pending():
+    # A red suite placeholder (status completed, failed conclusion) must render
+    # under its conclusion group, NOT the "no jobs reported yet" group.
+    items = [
+        _item("Validate PR title", workflow_name="Semantic PR Title"),
+        CheckItem(kind="actions", name="CI", workflow_name="CI",
+                  status="completed", conclusion="startup_failure", url=None,
+                  required=False, check_run_id=None, run_id=200,
+                  workflow_run_url=None, suite_placeholder=True),
+    ]
+    pr = {"state": "open", "mergeable": True, "mergeable_state": "clean"}
+    code, summary = evaluate_snapshot(items, pr_meta=pr, pr_number=1, ignore_rules=[])
+    assert code == 3
+    assert "Startup failure: CI" in summary
+    assert "In progress (no jobs reported yet)" not in summary
