@@ -16,25 +16,42 @@ def _pr_meta(state="open", mergeable=True, mergeable_state="clean"):
 
 
 def _graphql_payload(nodes, *, has_next=False, end_cursor="X", head_sha="sha1",
-                     pr_state="OPEN"):
+                     pr_state="OPEN", suites=None, suites_has_next=False,
+                     suites_end_cursor="S2"):
+    commit = {"statusCheckRollup": {"contexts": {
+        "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor},
+        "nodes": nodes,
+    }}}
+    if suites is not None:
+        commit["checkSuites"] = {
+            "pageInfo": {"hasNextPage": suites_has_next, "endCursor": suites_end_cursor},
+            "nodes": suites,
+        }
     return {
         "repository": {
             "pullRequest": {
                 "state": pr_state,
                 "mergeable": "MERGEABLE",
                 "headRefOid": head_sha,
-                "commits": {
-                    "nodes": [
-                        {"commit": {"statusCheckRollup": {
-                            "contexts": {
-                                "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor},
-                                "nodes": nodes,
-                            }}}}
-                    ]
-                },
+                "commits": {"nodes": [{"commit": commit}]},
             }
         }
     }
+
+
+def _suite(*, status="QUEUED", conclusion=None, app_slug="github-actions",
+           run_db_id=200, workflow="CI", with_workflow_run=True, runs=0):
+    node = {
+        "status": status, "conclusion": conclusion,
+        "app": {"slug": app_slug}, "checkRuns": {"totalCount": runs},
+    }
+    node["workflowRun"] = (
+        {"databaseId": run_db_id,
+         "url": f"https://example.com/runs/{run_db_id}",
+         "workflow": {"name": workflow}}
+        if with_workflow_run else None
+    )
+    return node
 
 
 def _node(name, *, status="COMPLETED", conclusion="SUCCESS", required=False, db_id=1):
@@ -575,3 +592,71 @@ def test_watch_resolution_line_dimmed_when_palette_enabled(fake_gh):
     # The resolution line is printed to stderr and dimmed.
     assert "\033[2m" in stderr_output
     assert "Watching" in stderr_output
+
+
+# Pending check-suite gate (hole#440 false green) =====
+
+
+def test_watch_does_not_green_while_actions_suite_queued(fake_gh):
+    # Initial snapshot: fast check passed, CI run queued with no jobs (suite
+    # only). Must NOT exit green on the initial snapshot; must keep watching
+    # until CI's jobs report and complete.
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    queued = _graphql_payload(
+        [_node("Validate PR title", conclusion="SUCCESS", db_id=1)],
+        suites=[
+            _suite(status="COMPLETED", conclusion="SUCCESS", run_db_id=100,
+                   workflow="Semantic PR Title", runs=1),
+            _suite(status="QUEUED", run_db_id=200, workflow="CI", runs=0),
+        ],
+    )
+    done = _graphql_payload(
+        [
+            _node("Validate PR title", conclusion="SUCCESS", db_id=1),
+            _node("Build", conclusion="SUCCESS", db_id=2),
+        ],
+        suites=[
+            _suite(status="COMPLETED", conclusion="SUCCESS", run_db_id=100,
+                   workflow="Semantic PR Title", runs=1),
+            _suite(status="COMPLETED", conclusion="SUCCESS", run_db_id=200,
+                   workflow="CI", runs=1),
+        ],
+    )
+    fake_gh.queue_graphql(queued, done)
+    code, summary, _, _ = _run_watch_pr(fake_gh, interval=5.0)
+    assert code == 0, summary
+    # Proves it did NOT exit on the initial snapshot — it looped to the second.
+    assert len(fake_gh.graphql_calls) == 2
+
+
+def test_watch_times_out_while_only_queued_suite(fake_gh):
+    # CI stays queued forever (no jobs). gh-ci must hold at "in progress" and
+    # hit the timeout (exit 7) — never a false green.
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    queued = _graphql_payload(
+        [_node("Validate PR title", conclusion="SUCCESS", db_id=1)],
+        suites=[_suite(status="QUEUED", run_db_id=200, workflow="CI", runs=0)],
+    )
+    fake_gh.queue_graphql(*[queued for _ in range(100)])
+    clock = FakeClock()
+    code, summary, _, _ = _run_watch_pr(
+        fake_gh, interval=5.0, timeout=20.0, clock=clock,
+    )
+    assert code == 7
+    assert "In progress (no jobs reported yet): CI" in summary
+
+
+def test_watch_resolution_line_names_placeholder_run_when_only_suite(fake_gh):
+    # Rollup empty, only a queued CI suite → the resolution line should name
+    # the placeholder's run id (200) rather than falling back to a SHA.
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    queued = _graphql_payload(
+        [], suites=[_suite(status="QUEUED", run_db_id=200, workflow="CI", runs=0)],
+    )
+    fake_gh.queue_graphql(*[queued for _ in range(100)])
+    clock = FakeClock()
+    code, _, stderr, _ = _run_watch_pr(
+        fake_gh, interval=5.0, timeout=20.0, clock=clock,
+    )
+    assert code == 7
+    assert "Watching run 200 (queued) on PR #1 in o/r" in stderr
