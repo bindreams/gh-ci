@@ -8,3 +8,7 @@ build/
 *.egg-info/
 .coverage
 .tmp/
+
+# Claude Code
+CLAUDE.local.md
+.claude/*.local.*

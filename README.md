@@ -132,3 +132,11 @@ Argparse-generated errors (unknown subcommand, `--help`) are not colored — the
 - Required-check stalled detection only fires once the whole run goes quiescent — no job *in progress* and no state change for the `--stalled-timeout` window — with a required check still unreported, so a check waiting on a *running* `needs:` upstream is not falsely flagged. gh-ci does not read the workflow's `needs:`-graph, so it can't fully tell "blocked" from "orphaned", and two cases remain: an upstream that is only *queued* (not yet running) with nothing else active is treated as quiescent and its downstream can still be flagged; and because liveness is whole-run, a single in-progress job anywhere holds the gate open for every required check. It only catches checks GitHub lists in the rollup (including `state == "expected"`); checks GitHub never lists at all are invisible.
 - Cancelled jobs (including supersede-by-newer-push cancellations) count as failures. Re-run on the fresh push if you hit this.
 - No integration tests against real GitHub. Bugs found while dogfooding become unit tests.
+
+## License
+
+<img align="right" src="https://www.gnu.org/graphics/gplv3-127x51.png">
+
+Copyright (C) 2026, Anna Zhukova
+
+This project is licensed under the [GNU GPL version 3.0](LICENSE).
