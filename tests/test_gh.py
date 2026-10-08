@@ -308,7 +308,10 @@ UNKNOWN_FLAG_STDERR = (
     "unknown flag: --allow-escape-sequences\n\n"
     "Usage:  gh api <endpoint> [flags]\n"
 )
-
+ESCAPE_REFUSAL_STDERR = (
+    "the response contains terminal escape sequences; "
+    "pass --allow-escape-sequences to output it anyway\n"
+)
 
 
 def test_gh_api_download_streams_to_tmp_then_renames(fp, tmp_path: Path):
@@ -416,6 +419,20 @@ def test_gh_api_download_retries_without_flag_on_old_gh(fp, tmp_path: Path):
     assert not (tmp_path / "out.log.tmp").exists()
     assert fp.call_count(flagged) == 1
     assert fp.call_count(plain) == 1
+
+
+def test_gh_api_download_follows_gh_upgrade_between_attempts(fp, tmp_path: Path):
+    # Old gh rejects the flag, then gh is upgraded before the retry, which
+    # now refuses the escape sequences: switch back to the flag.
+    dest = tmp_path / "out.log"
+    flagged = ["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"]
+    fp.register(flagged, stderr=UNKNOWN_FLAG_STDERR, returncode=1)
+    fp.register(["gh", "api", "-X", "GET", "/jobs/1/logs"],
+                stderr=ESCAPE_REFUSAL_STDERR, returncode=1)
+    fp.register(flagged, stdout=b"\x1b[31mlog")
+    assert gh_api_download("/jobs/1/logs", dest) == 8
+    assert dest.read_bytes() == b"\x1b[31mlog"
+    assert fp.call_count(flagged) == 2
 
 
 def test_gh_api_download_retry_keeps_hostname(fp, tmp_path: Path):
