@@ -227,10 +227,16 @@ def gh_api_download(
         assert proc.stdout is not None and proc.stderr is not None
         # Drain stderr concurrently: a full stderr pipe would block gh before
         # it closes stdout, deadlocking the read loop below.
-        stderr_chunks: list[bytes] = []
-        stderr_reader = threading.Thread(
-            target=lambda: stderr_chunks.append(proc.stderr.read())
-        )
+        stderr_result: list[bytes | BaseException] = []
+
+        def read_stderr() -> None:
+            assert proc.stderr is not None
+            try:
+                stderr_result.append(proc.stderr.read())
+            except BaseException as e:
+                stderr_result.append(e)
+
+        stderr_reader = threading.Thread(target=read_stderr)
         stderr_reader.start()
         try:
             with tmp_path.open("wb") as fh:
@@ -247,7 +253,10 @@ def gh_api_download(
             raise
         finally:
             stderr_reader.join()
-    stderr = b"".join(stderr_chunks).decode(errors="replace")
+    [stderr_bytes] = stderr_result
+    if isinstance(stderr_bytes, BaseException):
+        raise stderr_bytes
+    stderr = stderr_bytes.decode(errors="replace")
     if proc.returncode != 0:
         # Clean up zero-byte tmp files (e.g. immediate 404 with no body)
         actual_tmp: Path | None = tmp_path

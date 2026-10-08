@@ -388,14 +388,14 @@ def test_gh_api_download_drains_large_stderr(monkeypatch, tmp_path: Path):
     assert dest.read_bytes() == b"body"
 
 
-def _capture_popen(monkeypatch) -> dict:
+def _capture_popen(monkeypatch, stderr: io.BytesIO | None = None) -> dict:
     captured: dict = {}
 
     class _Proc:
         def __init__(self, args, **kwargs):
             captured.update(args=args, kwargs=kwargs)
             self.stdout = io.BytesIO(b"")
-            self.stderr = io.BytesIO(b"")
+            self.stderr = stderr if stderr is not None else io.BytesIO(b"")
             self.returncode = 0
 
         def __enter__(self):
@@ -470,3 +470,13 @@ def test_gh_api_download_joins_stderr_reader_before_closing(monkeypatch, tmp_pat
     with pytest.raises(GhError) as exc:
         gh_api_download("/jobs/1/logs", tmp_path / "out.log")
     assert exc.value.stderr == "gh: HTTP 500"
+
+
+def test_gh_api_download_raises_stderr_reader_error(monkeypatch, tmp_path: Path):
+    class _FailingStderr(io.BytesIO):
+        def read(self, *args):
+            raise OSError("stderr read failed")
+
+    _capture_popen(monkeypatch, stderr=_FailingStderr())
+    with pytest.raises(OSError, match="stderr read failed"):
+        gh_api_download("/jobs/1/logs", tmp_path / "out.log")
