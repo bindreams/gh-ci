@@ -201,6 +201,9 @@ def gh_api_graphql(
     return payload.get("data") or {}
 
 
+_ALLOW_ESCAPE_FLAG = "--allow-escape-sequences"
+
+
 def gh_api_download(
     path: str,
     dest: Path,
@@ -208,8 +211,19 @@ def gh_api_download(
     host: str | None = None,
     chunk_size: int = 64 * 1024,
 ) -> int:
-    sub = ["-X", "GET", path]
-    args = _api_args(host, sub)
+    # Body goes to a file, never a terminal, so escape sequences are safe.
+    flagged = _api_args(host, [_ALLOW_ESCAPE_FLAG, "-X", "GET", path])
+    try:
+        return _download(flagged, dest, chunk_size)
+    except GhError as e:
+        # gh < 2.97 does not know the flag; it fails before making a request.
+        unknown_flag = e.stderr.partition("\n")[0] == f"unknown flag: {_ALLOW_ESCAPE_FLAG}"
+        if not (unknown_flag and e.bytes_written == 0):
+            raise
+    return _download(_api_args(host, ["-X", "GET", path]), dest, chunk_size)
+
+
+def _download(args: list[str], dest: Path, chunk_size: int) -> int:
     tmp_path = dest.with_suffix(dest.suffix + ".tmp")
     bytes_written = 0
     proc = subprocess.Popen(

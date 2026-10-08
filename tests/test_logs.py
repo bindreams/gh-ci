@@ -856,3 +856,45 @@ def test_pr_target_skips_queued_suite_placeholder(fake_gh, tmp_path):
     assert code == 0
     subdirs = list(tmp_path.iterdir())
     assert {s.name for s in subdirs} == {"gh-ci-999-2026-05-25T14-30-00Z"}
+
+
+# Escape sequences (real gh_api_download) =====
+
+
+def test_log_with_escape_sequences_is_saved_verbatim(fake_gh, fp, tmp_path):
+    # gh >= 2.97 refuses non-JSON bodies containing escape sequences unless
+    # --allow-escape-sequences is passed. Coloured CI logs always contain them.
+    fake_gh.set_get(
+        "/repos/o/r/actions/jobs/55",
+        {"id": 55, "name": "Build", "status": "completed", "conclusion": "failure",
+         "html_url": "u", "run_id": 1000},
+    )
+    fake_gh.set_get("/repos/o/r/actions/runs/1000", {"id": 1000, "name": "CI"})
+    body = b"\x1b[31merror\x1b[0m\n\xff\xfe raw\n"
+    fp.register(
+        ["gh", "api", "-X", "GET", "/repos/o/r/actions/jobs/55/logs"],
+        stderr="the response contains terminal escape sequences; "
+               "pass --allow-escape-sequences to output it anyway\n",
+        returncode=1,
+    )
+    fp.register(
+        ["gh", "api", "--allow-escape-sequences", "-X", "GET",
+         "/repos/o/r/actions/jobs/55/logs"],
+        stdout=body,
+    )
+
+    code = run_logs(
+        target=JobTarget(owner="o", repo="r", host="github.com",
+                         run_id=1000, job_id=55),
+        failed_only=False, ignore_rules=[], output_dir=tmp_path,
+        stderr=io.StringIO(), gh_get=fake_gh.gh_get, now=NOW,
+    )
+
+    assert code == 0
+    run_dir = tmp_path / "gh-ci-1000-2026-05-25T14-30-00Z"
+    assert (run_dir / "55-Build.log").read_bytes() == body
+    assert not (run_dir / "55-Build.log.tmp").exists()
+    [entry] = json.loads((run_dir / "manifest.json").read_text())["jobs"]
+    assert entry["log_file"] == "55-Build.log"
+    assert entry["bytes_written"] == len(body)
+    assert entry["error"] is None

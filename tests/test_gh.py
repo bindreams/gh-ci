@@ -303,10 +303,17 @@ def test_gh_api_graphql_raises_GhError_when_errors_present(fp):
 
 # gh_api_download =====
 
+ESC_FLAG = "--allow-escape-sequences"
+UNKNOWN_FLAG_STDERR = (
+    "unknown flag: --allow-escape-sequences\n\n"
+    "Usage:  gh api <endpoint> [flags]\n"
+)
+
+
 
 def test_gh_api_download_streams_to_tmp_then_renames(fp, tmp_path: Path):
     dest = tmp_path / "out.log"
-    fp.register(["gh", "api", "-X", "GET", "/jobs/1/logs"], stdout=b"log bytes")
+    fp.register(["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"], stdout=b"log bytes")
     bytes_written = gh_api_download("/jobs/1/logs", dest)
     assert bytes_written == len(b"log bytes")
     assert dest.exists()
@@ -318,7 +325,7 @@ def test_gh_api_download_streams_to_tmp_then_renames(fp, tmp_path: Path):
 def test_gh_api_download_with_host_passes_hostname(fp, tmp_path: Path):
     dest = tmp_path / "out.log"
     fp.register(
-        ["gh", "api", "--hostname", "ghes.example.com", "-X", "GET", "/x/logs"],
+        ["gh", "api", "--hostname", "ghes.example.com", ESC_FLAG, "-X", "GET", "/x/logs"],
         stdout=b"a",
     )
     assert gh_api_download("/x/logs", dest, host="ghes.example.com") == 1
@@ -327,7 +334,7 @@ def test_gh_api_download_with_host_passes_hostname(fp, tmp_path: Path):
 def test_gh_api_download_leaves_tmp_on_failure(fp, tmp_path: Path):
     dest = tmp_path / "out.log"
     fp.register(
-        ["gh", "api", "-X", "GET", "/jobs/1/logs"],
+        ["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"],
         stdout=b"partial",
         stderr="gh: HTTP 500",
         returncode=1,
@@ -347,7 +354,7 @@ def test_gh_api_download_leaves_tmp_on_failure(fp, tmp_path: Path):
 def test_gh_api_download_404_carries_http_status(fp, tmp_path: Path):
     dest = tmp_path / "out.log"
     fp.register(
-        ["gh", "api", "-X", "GET", "/jobs/1/logs"],
+        ["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"],
         stdout=b"",
         stderr="gh: HTTP 404: Not Found",
         returncode=1,
@@ -395,3 +402,70 @@ def test_gh_api_download_passes_stdin_devnull(monkeypatch, tmp_path: Path):
         monkeypatch.setattr(subprocess, "Popen", real_popen)
 
     assert captured["kwargs"].get("stdin") is subprocess.DEVNULL
+
+
+def test_gh_api_download_retries_without_flag_on_old_gh(fp, tmp_path: Path):
+    # gh < 2.97 does not know --allow-escape-sequences.
+    dest = tmp_path / "out.log"
+    flagged = ["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"]
+    plain = ["gh", "api", "-X", "GET", "/jobs/1/logs"]
+    fp.register(flagged, stderr=UNKNOWN_FLAG_STDERR, returncode=1)
+    fp.register(plain, stdout=b"log")
+    assert gh_api_download("/jobs/1/logs", dest) == 3
+    assert dest.read_bytes() == b"log"
+    assert not (tmp_path / "out.log.tmp").exists()
+    assert fp.call_count(flagged) == 1
+    assert fp.call_count(plain) == 1
+
+
+def test_gh_api_download_retry_keeps_hostname(fp, tmp_path: Path):
+    host = ["--hostname", "ghes.example.com"]
+    fp.register(["gh", "api", *host, ESC_FLAG, "-X", "GET", "/x/logs"],
+                stderr=UNKNOWN_FLAG_STDERR, returncode=1)
+    fp.register(["gh", "api", *host, "-X", "GET", "/x/logs"], stdout=b"a")
+    assert gh_api_download("/x/logs", tmp_path / "out.log", host="ghes.example.com") == 1
+
+
+def test_gh_api_download_retry_failure_raises_retry_error(fp, tmp_path: Path):
+    # The retry's own error (here a 404) must surface, not the unknown-flag one.
+    fp.register(["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"],
+                stderr=UNKNOWN_FLAG_STDERR, returncode=1)
+    fp.register(["gh", "api", "-X", "GET", "/jobs/1/logs"],
+                stderr="gh: Not Found (HTTP 404)", returncode=1)
+    with pytest.raises(GhError) as exc:
+        gh_api_download("/jobs/1/logs", tmp_path / "out.log")
+    assert parse_http_status(exc.value.stderr) == 404
+    assert exc.value.tmp_path is None
+    assert not (tmp_path / "out.log.tmp").exists()
+
+
+def test_gh_api_download_retry_partial_failure_keeps_retry_tmp(fp, tmp_path: Path):
+    fp.register(["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"],
+                stderr=UNKNOWN_FLAG_STDERR, returncode=1)
+    fp.register(["gh", "api", "-X", "GET", "/jobs/1/logs"],
+                stdout=b"partial", stderr="gh: HTTP 500", returncode=1)
+    with pytest.raises(GhError) as exc:
+        gh_api_download("/jobs/1/logs", tmp_path / "out.log")
+    assert exc.value.bytes_written == len(b"partial")
+    assert exc.value.tmp_path == tmp_path / "out.log.tmp"
+    assert exc.value.tmp_path.read_bytes() == b"partial"
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr"),
+    [
+        pytest.param(b"", "gh: HTTP 500", id="other-error"),
+        pytest.param(b"", "", id="empty-stderr"),
+        pytest.param(b"x", UNKNOWN_FLAG_STDERR, id="bytes-written"),
+        pytest.param(b"", "warning: x\n" + UNKNOWN_FLAG_STDERR, id="not-first-line"),
+    ],
+)
+def test_gh_api_download_does_not_retry(fp, tmp_path: Path, stdout, stderr):
+    plain = ["gh", "api", "-X", "GET", "/jobs/1/logs"]
+    fp.register(["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"],
+                stdout=stdout, stderr=stderr, returncode=1)
+    fp.register(plain, stdout=b"should not be fetched")
+    with pytest.raises(GhError) as exc:
+        gh_api_download("/jobs/1/logs", tmp_path / "out.log")
+    assert exc.value.stderr == stderr
+    assert fp.call_count(plain) == 0
