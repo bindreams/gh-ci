@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -408,7 +409,6 @@ def test_gh_api_download_passes_stdin_devnull(monkeypatch, tmp_path: Path):
 
 
 def test_gh_api_download_retries_without_flag_on_old_gh(fp, tmp_path: Path):
-    # gh < 2.97 does not know --allow-escape-sequences.
     dest = tmp_path / "out.log"
     flagged = ["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"]
     plain = ["gh", "api", "-X", "GET", "/jobs/1/logs"]
@@ -475,6 +475,7 @@ def test_gh_api_download_retry_partial_failure_keeps_retry_tmp(fp, tmp_path: Pat
         pytest.param(b"", "", id="empty-stderr"),
         pytest.param(b"x", UNKNOWN_FLAG_STDERR, id="bytes-written"),
         pytest.param(b"", "warning: x\n" + UNKNOWN_FLAG_STDERR, id="not-first-line"),
+        pytest.param(b"", ESCAPE_REFUSAL_STDERR, id="refusal-despite-flag"),
     ],
 )
 def test_gh_api_download_does_not_retry(fp, tmp_path: Path, stdout, stderr):
@@ -486,3 +487,53 @@ def test_gh_api_download_does_not_retry(fp, tmp_path: Path, stdout, stderr):
         gh_api_download("/jobs/1/logs", tmp_path / "out.log")
     assert exc.value.stderr == stderr
     assert fp.call_count(plain) == 0
+
+
+GH_DEBUG_STDERR = "* Request at 2026-10-08 13:43:59\n* Request took 971ms\n"
+
+
+def _crlf(text: str) -> str:
+    return text.replace("\n", "\r\n")
+
+
+@pytest.mark.parametrize(
+    ("unknown_flag", "refusal"),
+    [
+        pytest.param(UNKNOWN_FLAG_STDERR, ESCAPE_REFUSAL_STDERR, id="plain"),
+        # GH_DEBUG logs the HTTP exchange to stderr before gh prints the error.
+        pytest.param(UNKNOWN_FLAG_STDERR, GH_DEBUG_STDERR + ESCAPE_REFUSAL_STDERR,
+                     id="after-debug-output"),
+        pytest.param(_crlf(UNKNOWN_FLAG_STDERR), _crlf(ESCAPE_REFUSAL_STDERR), id="crlf"),
+        pytest.param(UNKNOWN_FLAG_STDERR, ESCAPE_REFUSAL_STDERR + "\n\n", id="trailing-blank-lines"),
+    ],
+)
+def test_gh_api_download_switches_back_on_refusal(fp, tmp_path: Path, unknown_flag, refusal):
+    flagged = ["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"]
+    fp.register(flagged, stderr=unknown_flag, returncode=1)
+    fp.register(["gh", "api", "-X", "GET", "/jobs/1/logs"], stderr=refusal, returncode=1)
+    fp.register(flagged, stdout=b"log")
+    assert gh_api_download("/jobs/1/logs", tmp_path / "out.log") == 3
+
+
+def test_gh_api_download_does_not_switch_back_when_bytes_written(fp, tmp_path: Path):
+    flagged = ["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"]
+    fp.register(flagged, stderr=UNKNOWN_FLAG_STDERR, returncode=1)
+    fp.register(["gh", "api", "-X", "GET", "/jobs/1/logs"],
+                stdout=b"x", stderr=ESCAPE_REFUSAL_STDERR, returncode=1)
+    with pytest.raises(GhError) as exc:
+        gh_api_download("/jobs/1/logs", tmp_path / "out.log")
+    assert exc.value.stderr == ESCAPE_REFUSAL_STDERR
+    assert fp.call_count(flagged) == 1
+
+
+def test_gh_api_download_drains_large_stderr(monkeypatch, tmp_path: Path):
+    # GH_DEBUG=api logs up to ~100 KB of response body to stderr before gh
+    # writes stdout; more than a pipe buffer holds. Uses a real process.
+    script = (
+        "import sys; sys.stderr.write('d' * 1_000_000); sys.stderr.flush(); "
+        "sys.stdout.write('body')"
+    )
+    monkeypatch.setattr("ghci.gh._api_args", lambda host, sub: [sys.executable, "-c", script])
+    dest = tmp_path / "out.log"
+    assert gh_api_download("/jobs/1/logs", dest) == 4
+    assert dest.read_bytes() == b"body"

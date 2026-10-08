@@ -4,6 +4,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -218,18 +219,24 @@ def gh_api_download(
 ) -> int:
     # Body goes to a file, never a terminal, so escape sequences are safe.
     # gh < 2.97 rejects the flag; gh >= 2.97 refuses escape sequences without
-    # it. Switch only on those errors, so a gh upgrade or downgrade between
-    # attempts is followed; each switch needs another version change.
+    # it. Switching variants only on gh's own error follows a gh upgrade or
+    # downgrade between attempts; each switch needs a version change, so the
+    # loop terminates.
     allow_escape = True
     while True:
         flag = [_ALLOW_ESCAPE_FLAG] if allow_escape else []
         try:
             return _download(_api_args(host, [*flag, "-X", "GET", path]), dest, chunk_size)
         except GhError as e:
-            first_line = e.stderr.partition("\n")[0]
-            if allow_escape and first_line == _UNKNOWN_FLAG_ERROR and e.bytes_written == 0:
+            if e.bytes_written != 0:
+                raise
+            lines = e.stderr.strip().splitlines()
+            # Cobra rejects the flag before anything else is printed (usage
+            # follows). The refusal comes after the HTTP exchange, which
+            # GH_DEBUG logs to stderr first.
+            if allow_escape and lines[:1] == [_UNKNOWN_FLAG_ERROR]:
                 allow_escape = False
-            elif not allow_escape and first_line == _ESCAPE_REFUSAL_ERROR:
+            elif not allow_escape and lines[-1:] == [_ESCAPE_REFUSAL_ERROR]:
                 allow_escape = True
             else:
                 raise
@@ -238,28 +245,31 @@ def gh_api_download(
 def _download(args: list[str], dest: Path, chunk_size: int) -> int:
     tmp_path = dest.with_suffix(dest.suffix + ".tmp")
     bytes_written = 0
-    proc = subprocess.Popen(
-        args,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    assert proc.stdout is not None
-    try:
-        with tmp_path.open("wb") as fh:
-            while True:
-                chunk = proc.stdout.read(chunk_size)
-                if not chunk:
-                    break
-                fh.write(chunk)
-                bytes_written += len(chunk)
-        proc.wait()
-    except BaseException:
-        proc.kill()
-        proc.wait()
-        raise
-    stderr_bytes = proc.stderr.read() if proc.stderr is not None else b""
-    stderr = stderr_bytes.decode(errors="replace")
+    # stderr goes to a file, not a pipe: gh may write more stderr than a pipe
+    # buffer holds (GH_DEBUG) before stdout, which would deadlock the reader.
+    with tempfile.TemporaryFile() as stderr_file:
+        proc = subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=stderr_file,
+        )
+        assert proc.stdout is not None
+        try:
+            with tmp_path.open("wb") as fh:
+                while True:
+                    chunk = proc.stdout.read(chunk_size)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    bytes_written += len(chunk)
+            proc.wait()
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            raise
+        stderr_file.seek(0)
+        stderr = stderr_file.read().decode(errors="replace")
     if proc.returncode != 0:
         # Clean up zero-byte tmp files (e.g. immediate 404 with no body)
         actual_tmp: Path | None = tmp_path
