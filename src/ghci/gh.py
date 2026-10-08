@@ -231,10 +231,9 @@ def gh_api_download(
             if e.bytes_written != 0:
                 raise
             lines = e.stderr.strip().splitlines()
-            # Cobra rejects the flag before anything else is printed (usage
-            # follows). The refusal comes after the HTTP exchange, which
-            # GH_DEBUG logs to stderr first.
-            if allow_escape and lines[:1] == [_UNKNOWN_FLAG_ERROR]:
+            # Cobra prints the unknown-flag error before usage text; gh prints
+            # other errors last.
+            if allow_escape and _UNKNOWN_FLAG_ERROR in lines:
                 allow_escape = False
             elif not allow_escape and lines[-1:] == [_ESCAPE_REFUSAL_ERROR]:
                 allow_escape = True
@@ -245,15 +244,19 @@ def gh_api_download(
 def _download(args: list[str], dest: Path, chunk_size: int) -> int:
     tmp_path = dest.with_suffix(dest.suffix + ".tmp")
     bytes_written = 0
-    # stderr goes to a file, not a pipe: gh may write more stderr than a pipe
-    # buffer holds (GH_DEBUG) before stdout, which would deadlock the reader.
-    with tempfile.TemporaryFile() as stderr_file:
-        proc = subprocess.Popen(
-            args,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=stderr_file,
-        )
+    # stderr goes to a file, not a pipe: a full stderr pipe would block gh
+    # before it closes stdout, deadlocking the read loop below. The file lives
+    # next to dest, which must be writable anyway.
+    # GH_DEBUG (or legacy DEBUG) would log the whole log body to stderr, which
+    # feeds error classification and the manifest.
+    env = {k: v for k, v in os.environ.items() if k not in ("GH_DEBUG", "DEBUG")}
+    with tempfile.TemporaryFile(dir=dest.parent) as stderr_file, subprocess.Popen(
+        args,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=stderr_file,
+        env=env,
+    ) as proc:
         assert proc.stdout is not None
         try:
             with tmp_path.open("wb") as fh:

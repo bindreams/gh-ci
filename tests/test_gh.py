@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import gc
+import io
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -375,36 +378,8 @@ def test_gh_api_download_passes_stdin_devnull(monkeypatch, tmp_path: Path):
     # subprocess.Popen so the child process does not inherit the parent's
     # stdin. If `gh` prompts for interactive auth (or anything else), it
     # would otherwise hang waiting for input the agent will never provide.
-    captured: dict[str, object] = {}
-    real_popen = subprocess.Popen
-
-    class _FakeProc:
-        def __init__(self, args, **kwargs):
-            captured["args"] = args
-            captured["kwargs"] = kwargs
-            self.stdout = _Empty()
-            self.stderr = _Empty()
-            self.returncode = 0
-
-        def wait(self):
-            return 0
-
-        def kill(self):
-            pass
-
-    class _Empty:
-        def read(self, *_a, **_k):
-            return b""
-
-    def fake_popen(args, **kwargs):
-        return _FakeProc(args, **kwargs)
-
-    monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    try:
-        gh_api_download("/jobs/1/logs", tmp_path / "out.log")
-    finally:
-        monkeypatch.setattr(subprocess, "Popen", real_popen)
-
+    captured = _capture_popen(monkeypatch)
+    gh_api_download("/jobs/1/logs", tmp_path / "out.log")
     assert captured["kwargs"].get("stdin") is subprocess.DEVNULL
 
 
@@ -474,7 +449,6 @@ def test_gh_api_download_retry_partial_failure_keeps_retry_tmp(fp, tmp_path: Pat
         pytest.param(b"", "gh: HTTP 500", id="other-error"),
         pytest.param(b"", "", id="empty-stderr"),
         pytest.param(b"x", UNKNOWN_FLAG_STDERR, id="bytes-written"),
-        pytest.param(b"", "warning: x\n" + UNKNOWN_FLAG_STDERR, id="not-first-line"),
         pytest.param(b"", ESCAPE_REFUSAL_STDERR, id="refusal-despite-flag"),
     ],
 )
@@ -500,6 +474,8 @@ def _crlf(text: str) -> str:
     ("unknown_flag", "refusal"),
     [
         pytest.param(UNKNOWN_FLAG_STDERR, ESCAPE_REFUSAL_STDERR, id="plain"),
+        pytest.param("warning: x\n" + UNKNOWN_FLAG_STDERR, ESCAPE_REFUSAL_STDERR,
+                     id="unknown-flag-not-first-line"),
         # GH_DEBUG logs the HTTP exchange to stderr before gh prints the error.
         pytest.param(UNKNOWN_FLAG_STDERR, GH_DEBUG_STDERR + ESCAPE_REFUSAL_STDERR,
                      id="after-debug-output"),
@@ -537,3 +513,91 @@ def test_gh_api_download_drains_large_stderr(monkeypatch, tmp_path: Path):
     dest = tmp_path / "out.log"
     assert gh_api_download("/jobs/1/logs", dest) == 4
     assert dest.read_bytes() == b"body"
+
+
+def test_gh_api_download_does_not_switch_back_when_refusal_is_not_last(fp, tmp_path: Path):
+    # gh prints its own error last; an earlier refusal line is not gh's error.
+    flagged = ["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"]
+    fp.register(flagged, stderr=UNKNOWN_FLAG_STDERR, returncode=1)
+    fp.register(["gh", "api", "-X", "GET", "/jobs/1/logs"],
+                stderr=ESCAPE_REFUSAL_STDERR + "gh: HTTP 500\n", returncode=1)
+    with pytest.raises(GhError):
+        gh_api_download("/jobs/1/logs", tmp_path / "out.log")
+    assert fp.call_count(flagged) == 1
+
+
+def test_gh_api_download_does_not_retry_unknown_flag_without_flag(fp, tmp_path: Path):
+    plain = ["gh", "api", "-X", "GET", "/jobs/1/logs"]
+    fp.register(["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"],
+                stderr=UNKNOWN_FLAG_STDERR, returncode=1)
+    fp.register(plain, stderr=UNKNOWN_FLAG_STDERR, returncode=1)
+    fp.register(plain, stdout=b"should not be fetched")
+    with pytest.raises(GhError):
+        gh_api_download("/jobs/1/logs", tmp_path / "out.log")
+    assert fp.call_count(plain) == 1
+
+
+def _capture_popen(monkeypatch) -> dict:
+    captured: dict = {}
+
+    class _Proc:
+        def __init__(self, args, **kwargs):
+            captured.update(args=args, kwargs=kwargs)
+            self.stdout = io.BytesIO(b"")
+            self.returncode = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.stdout.close()
+
+        def wait(self):
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(subprocess, "Popen", _Proc)
+    return captured
+
+
+def test_gh_api_download_does_not_pipe_stderr(monkeypatch, tmp_path: Path):
+    # A stderr pipe deadlocks once gh fills it before closing stdout.
+    captured = _capture_popen(monkeypatch)
+    gh_api_download("/jobs/1/logs", tmp_path / "out.log")
+    assert captured["kwargs"]["stderr"] is not subprocess.PIPE
+
+
+def test_gh_api_download_strips_gh_debug_env(monkeypatch, tmp_path: Path):
+    # gh's debug log would dump the whole log body into the captured stderr
+    # that error classification and the manifest read.
+    monkeypatch.setenv("GH_DEBUG", "api")
+    monkeypatch.setenv("DEBUG", "api")
+    monkeypatch.setenv("GH_CI_TEST_KEEP", "1")
+    captured = _capture_popen(monkeypatch)
+    gh_api_download("/jobs/1/logs", tmp_path / "out.log")
+    env = captured["kwargs"]["env"]
+    assert "GH_DEBUG" not in env and "DEBUG" not in env
+    assert env["GH_CI_TEST_KEEP"] == "1"
+
+
+def test_gh_api_download_works_without_system_temp_dir(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "missing"))
+    monkeypatch.setattr(
+        "ghci.gh._api_args",
+        lambda host, sub: [sys.executable, "-c", "import sys; sys.stdout.write('body')"],
+    )
+    dest = tmp_path / "out.log"
+    assert gh_api_download("/jobs/1/logs", dest) == 4
+
+
+@pytest.mark.filterwarnings("error::ResourceWarning")
+@pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
+def test_gh_api_download_closes_pipes(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(
+        "ghci.gh._api_args",
+        lambda host, sub: [sys.executable, "-c", "import sys; sys.stdout.write('body')"],
+    )
+    gh_api_download("/jobs/1/logs", tmp_path / "out.log")
+    gc.collect()
