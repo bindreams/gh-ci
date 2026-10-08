@@ -4,7 +4,6 @@ import gc
 import io
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -377,7 +376,7 @@ def test_gh_api_download_passes_stdin_devnull(monkeypatch, tmp_path: Path):
 
 def test_gh_api_download_drains_large_stderr(monkeypatch, tmp_path: Path):
     # More stderr than a pipe buffer holds, written before stdout. Uses a
-    # real process.
+    # real process; a regression deadlocks here.
     script = (
         "import sys; sys.stderr.write('d' * 1_000_000); sys.stderr.flush(); "
         "sys.stdout.write('body')"
@@ -395,6 +394,7 @@ def _capture_popen(monkeypatch) -> dict:
         def __init__(self, args, **kwargs):
             captured.update(args=args, kwargs=kwargs)
             self.stdout = io.BytesIO(b"")
+            self.stderr = io.BytesIO(b"")
             self.returncode = 0
 
         def __enter__(self):
@@ -402,6 +402,7 @@ def _capture_popen(monkeypatch) -> dict:
 
         def __exit__(self, *exc):
             self.stdout.close()
+            self.stderr.close()
 
         def wait(self):
             return 0
@@ -411,13 +412,6 @@ def _capture_popen(monkeypatch) -> dict:
 
     monkeypatch.setattr(subprocess, "Popen", _Proc)
     return captured
-
-
-def test_gh_api_download_does_not_pipe_stderr(monkeypatch, tmp_path: Path):
-    # A stderr pipe deadlocks once gh fills it before closing stdout.
-    captured = _capture_popen(monkeypatch)
-    gh_api_download("/jobs/1/logs", tmp_path / "out.log")
-    assert captured["kwargs"]["stderr"] is not subprocess.PIPE
 
 
 def test_gh_api_download_strips_gh_debug_env(monkeypatch, tmp_path: Path):
@@ -431,16 +425,6 @@ def test_gh_api_download_strips_gh_debug_env(monkeypatch, tmp_path: Path):
     env = captured["kwargs"]["env"]
     assert "GH_DEBUG" not in env and "DEBUG" not in env
     assert env["GH_CI_TEST_KEEP"] == "1"
-
-
-def test_gh_api_download_works_without_system_temp_dir(monkeypatch, tmp_path: Path):
-    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "missing"))
-    monkeypatch.setattr(
-        "ghci.gh._api_args",
-        lambda host, sub: [sys.executable, "-c", "import sys; sys.stdout.write('body')"],
-    )
-    dest = tmp_path / "out.log"
-    assert gh_api_download("/jobs/1/logs", dest) == 4
 
 
 @pytest.mark.filterwarnings("error::ResourceWarning")
