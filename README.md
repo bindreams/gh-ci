@@ -10,6 +10,8 @@ Replaces hand-rolled `gh run watch` + `gh pr checks` loops with a tool that:
 
 ## Install
 
+Requires the latest [`gh`](https://cli.github.com/); older versions are not supported.
+
 ```sh
 uv tool install ~/src/gh-ci                              # local clone
 uv tool install git+https://github.com/<user>/gh-ci      # from GitHub

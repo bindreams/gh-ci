@@ -202,14 +202,6 @@ def gh_api_graphql(
     return payload.get("data") or {}
 
 
-_ALLOW_ESCAPE_FLAG = "--allow-escape-sequences"
-_UNKNOWN_FLAG_ERROR = f"unknown flag: {_ALLOW_ESCAPE_FLAG}"
-_ESCAPE_REFUSAL_ERROR = (
-    "the response contains terminal escape sequences; "
-    f"pass {_ALLOW_ESCAPE_FLAG} to output it anyway"
-)
-
-
 def gh_api_download(
     path: str,
     dest: Path,
@@ -218,30 +210,8 @@ def gh_api_download(
     chunk_size: int = 64 * 1024,
 ) -> int:
     # Body goes to a file, never a terminal, so escape sequences are safe.
-    # gh < 2.97 rejects the flag; gh >= 2.97 refuses escape sequences without
-    # it. Switching variants only on gh's own error follows a gh upgrade or
-    # downgrade between attempts; each switch needs a version change, so the
-    # loop terminates.
-    allow_escape = True
-    while True:
-        flag = [_ALLOW_ESCAPE_FLAG] if allow_escape else []
-        try:
-            return _download(_api_args(host, [*flag, "-X", "GET", path]), dest, chunk_size)
-        except GhError as e:
-            if e.bytes_written != 0:
-                raise
-            lines = e.stderr.strip().splitlines()
-            # Cobra prints the unknown-flag error before usage text; gh prints
-            # other errors last.
-            if allow_escape and _UNKNOWN_FLAG_ERROR in lines:
-                allow_escape = False
-            elif not allow_escape and lines[-1:] == [_ESCAPE_REFUSAL_ERROR]:
-                allow_escape = True
-            else:
-                raise
-
-
-def _download(args: list[str], dest: Path, chunk_size: int) -> int:
+    sub = ["--allow-escape-sequences", "-X", "GET", path]
+    args = _api_args(host, sub)
     tmp_path = dest.with_suffix(dest.suffix + ".tmp")
     bytes_written = 0
     # stderr goes to a file, not a pipe: a full stderr pipe would block gh

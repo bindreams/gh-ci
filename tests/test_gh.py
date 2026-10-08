@@ -308,14 +308,6 @@ def test_gh_api_graphql_raises_GhError_when_errors_present(fp):
 # gh_api_download =====
 
 ESC_FLAG = "--allow-escape-sequences"
-UNKNOWN_FLAG_STDERR = (
-    "unknown flag: --allow-escape-sequences\n\n"
-    "Usage:  gh api <endpoint> [flags]\n"
-)
-ESCAPE_REFUSAL_STDERR = (
-    "the response contains terminal escape sequences; "
-    "pass --allow-escape-sequences to output it anyway\n"
-)
 
 
 def test_gh_api_download_streams_to_tmp_then_renames(fp, tmp_path: Path):
@@ -383,128 +375,9 @@ def test_gh_api_download_passes_stdin_devnull(monkeypatch, tmp_path: Path):
     assert captured["kwargs"].get("stdin") is subprocess.DEVNULL
 
 
-def test_gh_api_download_retries_without_flag_on_old_gh(fp, tmp_path: Path):
-    dest = tmp_path / "out.log"
-    flagged = ["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"]
-    plain = ["gh", "api", "-X", "GET", "/jobs/1/logs"]
-    fp.register(flagged, stderr=UNKNOWN_FLAG_STDERR, returncode=1)
-    fp.register(plain, stdout=b"log")
-    assert gh_api_download("/jobs/1/logs", dest) == 3
-    assert dest.read_bytes() == b"log"
-    assert not (tmp_path / "out.log.tmp").exists()
-    assert fp.call_count(flagged) == 1
-    assert fp.call_count(plain) == 1
-
-
-def test_gh_api_download_follows_gh_upgrade_between_attempts(fp, tmp_path: Path):
-    # Old gh rejects the flag, then gh is upgraded before the retry, which
-    # now refuses the escape sequences: switch back to the flag.
-    dest = tmp_path / "out.log"
-    flagged = ["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"]
-    fp.register(flagged, stderr=UNKNOWN_FLAG_STDERR, returncode=1)
-    fp.register(["gh", "api", "-X", "GET", "/jobs/1/logs"],
-                stderr=ESCAPE_REFUSAL_STDERR, returncode=1)
-    fp.register(flagged, stdout=b"\x1b[31mlog")
-    assert gh_api_download("/jobs/1/logs", dest) == 8
-    assert dest.read_bytes() == b"\x1b[31mlog"
-    assert fp.call_count(flagged) == 2
-
-
-def test_gh_api_download_retry_keeps_hostname(fp, tmp_path: Path):
-    host = ["--hostname", "ghes.example.com"]
-    fp.register(["gh", "api", *host, ESC_FLAG, "-X", "GET", "/x/logs"],
-                stderr=UNKNOWN_FLAG_STDERR, returncode=1)
-    fp.register(["gh", "api", *host, "-X", "GET", "/x/logs"], stdout=b"a")
-    assert gh_api_download("/x/logs", tmp_path / "out.log", host="ghes.example.com") == 1
-
-
-def test_gh_api_download_retry_failure_raises_retry_error(fp, tmp_path: Path):
-    # The retry's own error (here a 404) must surface, not the unknown-flag one.
-    fp.register(["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"],
-                stderr=UNKNOWN_FLAG_STDERR, returncode=1)
-    fp.register(["gh", "api", "-X", "GET", "/jobs/1/logs"],
-                stderr="gh: Not Found (HTTP 404)", returncode=1)
-    with pytest.raises(GhError) as exc:
-        gh_api_download("/jobs/1/logs", tmp_path / "out.log")
-    assert parse_http_status(exc.value.stderr) == 404
-    assert exc.value.tmp_path is None
-    assert not (tmp_path / "out.log.tmp").exists()
-
-
-def test_gh_api_download_retry_partial_failure_keeps_retry_tmp(fp, tmp_path: Path):
-    fp.register(["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"],
-                stderr=UNKNOWN_FLAG_STDERR, returncode=1)
-    fp.register(["gh", "api", "-X", "GET", "/jobs/1/logs"],
-                stdout=b"partial", stderr="gh: HTTP 500", returncode=1)
-    with pytest.raises(GhError) as exc:
-        gh_api_download("/jobs/1/logs", tmp_path / "out.log")
-    assert exc.value.bytes_written == len(b"partial")
-    assert exc.value.tmp_path == tmp_path / "out.log.tmp"
-    assert exc.value.tmp_path.read_bytes() == b"partial"
-
-
-@pytest.mark.parametrize(
-    ("stdout", "stderr"),
-    [
-        pytest.param(b"", "gh: HTTP 500", id="other-error"),
-        pytest.param(b"", "", id="empty-stderr"),
-        pytest.param(b"x", UNKNOWN_FLAG_STDERR, id="bytes-written"),
-        pytest.param(b"", ESCAPE_REFUSAL_STDERR, id="refusal-despite-flag"),
-    ],
-)
-def test_gh_api_download_does_not_retry(fp, tmp_path: Path, stdout, stderr):
-    plain = ["gh", "api", "-X", "GET", "/jobs/1/logs"]
-    fp.register(["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"],
-                stdout=stdout, stderr=stderr, returncode=1)
-    fp.register(plain, stdout=b"should not be fetched")
-    with pytest.raises(GhError) as exc:
-        gh_api_download("/jobs/1/logs", tmp_path / "out.log")
-    assert exc.value.stderr == stderr
-    assert fp.call_count(plain) == 0
-
-
-GH_DEBUG_STDERR = "* Request at 2026-10-08 13:43:59\n* Request took 971ms\n"
-
-
-def _crlf(text: str) -> str:
-    return text.replace("\n", "\r\n")
-
-
-@pytest.mark.parametrize(
-    ("unknown_flag", "refusal"),
-    [
-        pytest.param(UNKNOWN_FLAG_STDERR, ESCAPE_REFUSAL_STDERR, id="plain"),
-        pytest.param("warning: x\n" + UNKNOWN_FLAG_STDERR, ESCAPE_REFUSAL_STDERR,
-                     id="unknown-flag-not-first-line"),
-        # GH_DEBUG logs the HTTP exchange to stderr before gh prints the error.
-        pytest.param(UNKNOWN_FLAG_STDERR, GH_DEBUG_STDERR + ESCAPE_REFUSAL_STDERR,
-                     id="after-debug-output"),
-        pytest.param(_crlf(UNKNOWN_FLAG_STDERR), _crlf(ESCAPE_REFUSAL_STDERR), id="crlf"),
-        pytest.param(UNKNOWN_FLAG_STDERR, ESCAPE_REFUSAL_STDERR + "\n\n", id="trailing-blank-lines"),
-    ],
-)
-def test_gh_api_download_switches_back_on_refusal(fp, tmp_path: Path, unknown_flag, refusal):
-    flagged = ["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"]
-    fp.register(flagged, stderr=unknown_flag, returncode=1)
-    fp.register(["gh", "api", "-X", "GET", "/jobs/1/logs"], stderr=refusal, returncode=1)
-    fp.register(flagged, stdout=b"log")
-    assert gh_api_download("/jobs/1/logs", tmp_path / "out.log") == 3
-
-
-def test_gh_api_download_does_not_switch_back_when_bytes_written(fp, tmp_path: Path):
-    flagged = ["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"]
-    fp.register(flagged, stderr=UNKNOWN_FLAG_STDERR, returncode=1)
-    fp.register(["gh", "api", "-X", "GET", "/jobs/1/logs"],
-                stdout=b"x", stderr=ESCAPE_REFUSAL_STDERR, returncode=1)
-    with pytest.raises(GhError) as exc:
-        gh_api_download("/jobs/1/logs", tmp_path / "out.log")
-    assert exc.value.stderr == ESCAPE_REFUSAL_STDERR
-    assert fp.call_count(flagged) == 1
-
-
 def test_gh_api_download_drains_large_stderr(monkeypatch, tmp_path: Path):
-    # GH_DEBUG=api logs up to ~100 KB of response body to stderr before gh
-    # writes stdout; more than a pipe buffer holds. Uses a real process.
+    # More stderr than a pipe buffer holds, written before stdout. Uses a
+    # real process.
     script = (
         "import sys; sys.stderr.write('d' * 1_000_000); sys.stderr.flush(); "
         "sys.stdout.write('body')"
@@ -513,28 +386,6 @@ def test_gh_api_download_drains_large_stderr(monkeypatch, tmp_path: Path):
     dest = tmp_path / "out.log"
     assert gh_api_download("/jobs/1/logs", dest) == 4
     assert dest.read_bytes() == b"body"
-
-
-def test_gh_api_download_does_not_switch_back_when_refusal_is_not_last(fp, tmp_path: Path):
-    # gh prints its own error last; an earlier refusal line is not gh's error.
-    flagged = ["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"]
-    fp.register(flagged, stderr=UNKNOWN_FLAG_STDERR, returncode=1)
-    fp.register(["gh", "api", "-X", "GET", "/jobs/1/logs"],
-                stderr=ESCAPE_REFUSAL_STDERR + "gh: HTTP 500\n", returncode=1)
-    with pytest.raises(GhError):
-        gh_api_download("/jobs/1/logs", tmp_path / "out.log")
-    assert fp.call_count(flagged) == 1
-
-
-def test_gh_api_download_does_not_retry_unknown_flag_without_flag(fp, tmp_path: Path):
-    plain = ["gh", "api", "-X", "GET", "/jobs/1/logs"]
-    fp.register(["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"],
-                stderr=UNKNOWN_FLAG_STDERR, returncode=1)
-    fp.register(plain, stderr=UNKNOWN_FLAG_STDERR, returncode=1)
-    fp.register(plain, stdout=b"should not be fetched")
-    with pytest.raises(GhError):
-        gh_api_download("/jobs/1/logs", tmp_path / "out.log")
-    assert fp.call_count(plain) == 1
 
 
 def _capture_popen(monkeypatch) -> dict:
