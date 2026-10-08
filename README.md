@@ -77,6 +77,8 @@ Each per-run directory contains:
 - `<job_id>-<sanitized-name>.log.tmp` (or `.partial.log.tmp`) — download was truncated by an error; left on disk for forensics.
 - `manifest.json` — schema version 1; per-job metadata (status, conclusion, file path, bytes_written, partial, truncated, error).
 
+Logs are saved byte for byte, including ANSI color codes (view with `less -R`).
+
 ## Development
 
 ```sh
