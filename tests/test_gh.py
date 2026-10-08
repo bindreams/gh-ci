@@ -4,6 +4,7 @@ import gc
 import io
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -436,3 +437,36 @@ def test_gh_api_download_closes_pipes(monkeypatch, tmp_path: Path):
     )
     gh_api_download("/jobs/1/logs", tmp_path / "out.log")
     gc.collect()
+
+
+def test_gh_api_download_joins_stderr_reader_before_closing(monkeypatch, tmp_path: Path):
+    joined: list[bool] = []
+
+    class _Thread(threading.Thread):
+        def join(self, *args, **kwargs):
+            super().join(*args, **kwargs)
+            joined.append(True)
+
+    class _Proc:
+        def __init__(self, args, **kwargs):
+            self.stdout = io.BytesIO(b"")
+            self.stderr = io.BytesIO(b"gh: HTTP 500")
+            self.returncode = 1
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            assert joined, "pipes closed before the stderr reader was joined"
+
+        def wait(self):
+            return 1
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr("ghci.gh.threading.Thread", _Thread)
+    monkeypatch.setattr(subprocess, "Popen", _Proc)
+    with pytest.raises(GhError) as exc:
+        gh_api_download("/jobs/1/logs", tmp_path / "out.log")
+    assert exc.value.stderr == "gh: HTTP 500"
