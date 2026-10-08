@@ -10,6 +10,8 @@ Replaces hand-rolled `gh run watch` + `gh pr checks` loops with a tool that:
 
 ## Install
 
+Requires the latest [`gh`](https://cli.github.com/); older versions are not supported.
+
 ```sh
 uv tool install ~/src/gh-ci                              # local clone
 uv tool install git+https://github.com/<user>/gh-ci      # from GitHub
@@ -76,6 +78,8 @@ Each per-run directory contains:
 - `<job_id>-<sanitized-name>.partial.log` — job was in flight at download start.
 - `<job_id>-<sanitized-name>.log.tmp` (or `.partial.log.tmp`) — download was truncated by an error; left on disk for forensics.
 - `manifest.json` — schema version 1; per-job metadata (status, conclusion, file path, bytes_written, partial, truncated, error).
+
+Logs are saved byte for byte, including ANSI color codes (view with `less -R`).
 
 ## Development
 

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import gc
+import io
 import subprocess
+import sys
+import threading
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -303,10 +308,12 @@ def test_gh_api_graphql_raises_GhError_when_errors_present(fp):
 
 # gh_api_download =====
 
+ESC_FLAG = "--allow-escape-sequences"
+
 
 def test_gh_api_download_streams_to_tmp_then_renames(fp, tmp_path: Path):
     dest = tmp_path / "out.log"
-    fp.register(["gh", "api", "-X", "GET", "/jobs/1/logs"], stdout=b"log bytes")
+    fp.register(["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"], stdout=b"log bytes")
     bytes_written = gh_api_download("/jobs/1/logs", dest)
     assert bytes_written == len(b"log bytes")
     assert dest.exists()
@@ -318,7 +325,7 @@ def test_gh_api_download_streams_to_tmp_then_renames(fp, tmp_path: Path):
 def test_gh_api_download_with_host_passes_hostname(fp, tmp_path: Path):
     dest = tmp_path / "out.log"
     fp.register(
-        ["gh", "api", "--hostname", "ghes.example.com", "-X", "GET", "/x/logs"],
+        ["gh", "api", "--hostname", "ghes.example.com", ESC_FLAG, "-X", "GET", "/x/logs"],
         stdout=b"a",
     )
     assert gh_api_download("/x/logs", dest, host="ghes.example.com") == 1
@@ -327,7 +334,7 @@ def test_gh_api_download_with_host_passes_hostname(fp, tmp_path: Path):
 def test_gh_api_download_leaves_tmp_on_failure(fp, tmp_path: Path):
     dest = tmp_path / "out.log"
     fp.register(
-        ["gh", "api", "-X", "GET", "/jobs/1/logs"],
+        ["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"],
         stdout=b"partial",
         stderr="gh: HTTP 500",
         returncode=1,
@@ -347,7 +354,7 @@ def test_gh_api_download_leaves_tmp_on_failure(fp, tmp_path: Path):
 def test_gh_api_download_404_carries_http_status(fp, tmp_path: Path):
     dest = tmp_path / "out.log"
     fp.register(
-        ["gh", "api", "-X", "GET", "/jobs/1/logs"],
+        ["gh", "api", ESC_FLAG, "-X", "GET", "/jobs/1/logs"],
         stdout=b"",
         stderr="gh: HTTP 404: Not Found",
         returncode=1,
@@ -364,34 +371,160 @@ def test_gh_api_download_passes_stdin_devnull(monkeypatch, tmp_path: Path):
     # subprocess.Popen so the child process does not inherit the parent's
     # stdin. If `gh` prompts for interactive auth (or anything else), it
     # would otherwise hang waiting for input the agent will never provide.
-    captured: dict[str, object] = {}
-    real_popen = subprocess.Popen
+    captured = _capture_popen(monkeypatch)
+    gh_api_download("/jobs/1/logs", tmp_path / "out.log")
+    assert captured["kwargs"].get("stdin") is subprocess.DEVNULL
 
-    class _FakeProc:
+
+def test_gh_api_download_drains_large_stderr(monkeypatch, tmp_path: Path):
+    # Real process: stderr exceeds the pipe buffer and is written before stdout.
+    script = (
+        "import sys; sys.stderr.write('d' * 1_000_000); sys.stderr.flush(); "
+        "sys.stdout.write('body')"
+    )
+    monkeypatch.setattr("ghci.gh._api_args", lambda host, sub: [sys.executable, "-c", script])
+    dest = tmp_path / "out.log"
+    assert gh_api_download("/jobs/1/logs", dest) == 4
+    assert dest.read_bytes() == b"body"
+
+
+def _capture_popen(
+    monkeypatch, stderr: io.BytesIO | None = None, returncode: int = 0
+) -> dict:
+    captured: dict = {}
+
+    class _Proc:
         def __init__(self, args, **kwargs):
-            captured["args"] = args
-            captured["kwargs"] = kwargs
-            self.stdout = _Empty()
-            self.stderr = _Empty()
-            self.returncode = 0
+            captured.update(args=args, kwargs=kwargs)
+            self.stdout = io.BytesIO(b"")
+            self.stderr = stderr if stderr is not None else io.BytesIO(b"")
+            self.returncode = returncode
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.stdout.close()
+            self.stderr.close()
 
         def wait(self):
-            return 0
+            return self.returncode
 
         def kill(self):
             pass
 
-    class _Empty:
-        def read(self, *_a, **_k):
-            return b""
+    monkeypatch.setattr(subprocess, "Popen", _Proc)
+    return captured
 
-    def fake_popen(args, **kwargs):
-        return _FakeProc(args, **kwargs)
 
-    monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    try:
+def test_gh_api_download_strips_gh_debug_env(monkeypatch, tmp_path: Path):
+    # gh's debug log would dump the whole log body into the captured stderr
+    # that error classification and the manifest read.
+    monkeypatch.setenv("GH_DEBUG", "api")
+    monkeypatch.setenv("DEBUG", "api")
+    monkeypatch.setenv("GH_CI_TEST_KEEP", "1")
+    captured = _capture_popen(monkeypatch)
+    gh_api_download("/jobs/1/logs", tmp_path / "out.log")
+    env = captured["kwargs"]["env"]
+    assert "GH_DEBUG" not in env and "DEBUG" not in env
+    assert env["GH_CI_TEST_KEEP"] == "1"
+
+
+@pytest.mark.filterwarnings("error::ResourceWarning")
+@pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
+def test_gh_api_download_closes_pipes(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(
+        "ghci.gh._api_args",
+        lambda host, sub: [sys.executable, "-c", "import sys; sys.stdout.write('body')"],
+    )
+    gh_api_download("/jobs/1/logs", tmp_path / "out.log")
+    gc.collect()
+
+
+def test_gh_api_download_joins_stderr_reader_before_closing(monkeypatch, tmp_path: Path):
+    joined: list[bool] = []
+
+    class _Thread(threading.Thread):
+        def join(self, *args, **kwargs):
+            super().join(*args, **kwargs)
+            joined.append(True)
+
+    class _Proc:
+        def __init__(self, args, **kwargs):
+            self.stdout = io.BytesIO(b"")
+            self.stderr = io.BytesIO(b"gh: HTTP 500")
+            self.returncode = 1
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            assert joined, "pipes closed before the stderr reader was joined"
+
+        def wait(self):
+            return 1
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr("ghci.gh.threading", SimpleNamespace(Thread=_Thread))
+    monkeypatch.setattr(subprocess, "Popen", _Proc)
+    with pytest.raises(GhError) as exc:
         gh_api_download("/jobs/1/logs", tmp_path / "out.log")
-    finally:
-        monkeypatch.setattr(subprocess, "Popen", real_popen)
+    assert exc.value.stderr == "gh: HTTP 500"
 
-    assert captured["kwargs"].get("stdin") is subprocess.DEVNULL
+
+class _FailingStderr(io.BytesIO):
+    def read(self, *args):
+        raise OSError("stderr read failed")
+
+
+def test_gh_api_download_reports_stderr_reader_error_as_gh_error(monkeypatch, tmp_path: Path):
+    _capture_popen(monkeypatch, stderr=_FailingStderr(), returncode=1)
+    with pytest.raises(GhError) as exc:
+        gh_api_download("/jobs/1/logs", tmp_path / "out.log")
+    assert exc.value.returncode == 1
+    assert "stderr read failed" in exc.value.stderr
+
+
+def test_gh_api_download_succeeds_despite_stderr_reader_error(monkeypatch, tmp_path: Path):
+    _capture_popen(monkeypatch, stderr=_FailingStderr(), returncode=0)
+    dest = tmp_path / "out.log"
+    assert gh_api_download("/jobs/1/logs", dest) == 0
+    assert dest.exists()
+
+
+class _InterruptingStdout:
+    def __init__(self, inner):
+        self._inner = inner
+
+    def read(self, *args):
+        raise KeyboardInterrupt
+
+    def close(self):
+        self._inner.close()
+
+
+@pytest.mark.parametrize("failure", ["missing-dest-dir", "interrupted-read"])
+def test_gh_api_download_kills_gh_and_joins_reader_on_error(monkeypatch, tmp_path: Path, failure):
+    # The child keeps stderr open until killed, so the reader thread can only
+    # be joined after the kill.
+    script = "import sys, time; sys.stderr.write('x'); sys.stderr.flush(); time.sleep(3600)"
+    monkeypatch.setattr("ghci.gh._api_args", lambda host, sub: [sys.executable, "-c", script])
+    procs: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    class _Popen(real_popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            procs.append(self)
+            if failure == "interrupted-read":
+                self.stdout = _InterruptingStdout(self.stdout)
+
+    monkeypatch.setattr(subprocess, "Popen", _Popen)
+    dest = tmp_path / ("missing" if failure == "missing-dest-dir" else "") / "out.log"
+    expected = FileNotFoundError if failure == "missing-dest-dir" else KeyboardInterrupt
+    with pytest.raises(expected):
+        gh_api_download("/jobs/1/logs", dest)
+    [proc] = procs
+    assert proc.returncode is not None and proc.returncode != 0

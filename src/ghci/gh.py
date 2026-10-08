@@ -4,6 +4,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -208,32 +209,55 @@ def gh_api_download(
     host: str | None = None,
     chunk_size: int = 64 * 1024,
 ) -> int:
-    sub = ["-X", "GET", path]
+    # Body goes to a file, never a terminal, so escape sequences are safe.
+    sub = ["--allow-escape-sequences", "-X", "GET", path]
     args = _api_args(host, sub)
     tmp_path = dest.with_suffix(dest.suffix + ".tmp")
     bytes_written = 0
-    proc = subprocess.Popen(
+    # GH_DEBUG (or legacy DEBUG) would log the whole log body to stderr, which
+    # feeds error classification and the manifest.
+    env = {k: v for k, v in os.environ.items() if k not in ("GH_DEBUG", "DEBUG")}
+    with subprocess.Popen(
         args,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-    )
-    assert proc.stdout is not None
-    try:
-        with tmp_path.open("wb") as fh:
-            while True:
-                chunk = proc.stdout.read(chunk_size)
-                if not chunk:
-                    break
-                fh.write(chunk)
-                bytes_written += len(chunk)
-        proc.wait()
-    except BaseException:
-        proc.kill()
-        proc.wait()
-        raise
-    stderr_bytes = proc.stderr.read() if proc.stderr is not None else b""
-    stderr = stderr_bytes.decode(errors="replace")
+        env=env,
+    ) as proc:
+        assert proc.stdout is not None and proc.stderr is not None
+        # Drain stderr concurrently: a full stderr pipe would block gh before
+        # it closes stdout, deadlocking the read loop below.
+        stderr_result: list[bytes | BaseException] = []
+
+        def read_stderr() -> None:
+            assert proc.stderr is not None
+            try:
+                stderr_result.append(proc.stderr.read())
+            except BaseException as e:
+                stderr_result.append(e)
+
+        stderr_reader = threading.Thread(target=read_stderr)
+        stderr_reader.start()
+        try:
+            with tmp_path.open("wb") as fh:
+                while True:
+                    chunk = proc.stdout.read(chunk_size)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    bytes_written += len(chunk)
+            proc.wait()
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            raise
+        finally:
+            stderr_reader.join()
+    [stderr_bytes] = stderr_result
+    if isinstance(stderr_bytes, BaseException):
+        stderr = f"failed to read gh stderr: {stderr_bytes!r}"
+    else:
+        stderr = stderr_bytes.decode(errors="replace")
     if proc.returncode != 0:
         # Clean up zero-byte tmp files (e.g. immediate 404 with no body)
         actual_tmp: Path | None = tmp_path
