@@ -862,8 +862,9 @@ def test_pr_target_skips_queued_suite_placeholder(fake_gh, tmp_path):
 
 
 def test_log_with_escape_sequences_is_saved_verbatim(fake_gh, fp, tmp_path):
-    # gh >= 2.97 refuses non-JSON bodies containing escape sequences unless
-    # --allow-escape-sequences is passed; the plain call models that refusal.
+    # Integration check through the real gh_api_download: the flag is passed
+    # and the body reaches disk byte for byte. The unflagged registration
+    # mirrors gh's refusal, so dropping the flag fails here.
     fake_gh.set_get(
         "/repos/o/r/actions/jobs/55",
         {"id": 55, "name": "Build", "status": "completed", "conclusion": "failure",

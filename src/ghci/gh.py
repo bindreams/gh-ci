@@ -255,8 +255,9 @@ def gh_api_download(
             stderr_reader.join()
     [stderr_bytes] = stderr_result
     if isinstance(stderr_bytes, BaseException):
-        raise stderr_bytes
-    stderr = stderr_bytes.decode(errors="replace")
+        stderr = f"failed to read gh stderr: {stderr_bytes!r}"
+    else:
+        stderr = stderr_bytes.decode(errors="replace")
     if proc.returncode != 0:
         # Clean up zero-byte tmp files (e.g. immediate 404 with no body)
         actual_tmp: Path | None = tmp_path
