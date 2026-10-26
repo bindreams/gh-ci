@@ -4,20 +4,26 @@ import io
 
 from ghci.clock import FakeClock
 from ghci.ignore import IgnoreRule
-from ghci.target import PrTarget, RunTarget
+from ghci.target import PrTarget, RunTarget, WorkflowTarget
 from ghci.watch.loop import run_watch
 
 
 # Helpers =====
 
 
-def _pr_meta(state="open", mergeable=True, mergeable_state="clean"):
-    return {"state": state, "mergeable": mergeable, "mergeable_state": mergeable_state}
+def _pr_meta(state="open", mergeable=True, mergeable_state="clean", head_sha="sha1"):
+    meta = {"state": state, "mergeable": mergeable, "mergeable_state": mergeable_state}
+    if head_sha is not None:
+        meta["head"] = {"sha": head_sha}
+    return meta
+
+
+_SAME_AS_HEAD = object()
 
 
 def _graphql_payload(nodes, *, has_next=False, end_cursor="X", head_sha="sha1",
                      pr_state="OPEN", suites=None, suites_has_next=False,
-                     suites_end_cursor="S2"):
+                     suites_end_cursor="S2", branch_tip=_SAME_AS_HEAD):
     commit = {"statusCheckRollup": {"contexts": {
         "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor},
         "nodes": nodes,
@@ -33,6 +39,7 @@ def _graphql_payload(nodes, *, has_next=False, end_cursor="X", head_sha="sha1",
                 "state": pr_state,
                 "mergeable": "MERGEABLE",
                 "headRefOid": head_sha,
+                "headRef": {"target": {"oid": head_sha if branch_tip is _SAME_AS_HEAD else branch_tip}},
                 "commits": {"nodes": [{"commit": commit}]},
             }
         }
@@ -146,6 +153,7 @@ def test_pr_closed_exits_4_immediately(fake_gh):
 def test_pr_dirty_exits_4_immediately(fake_gh):
     fake_gh.set_get("/repos/o/r/pulls/1",
                      _pr_meta(mergeable=False, mergeable_state="dirty"))
+    fake_gh.queue_graphql(_graphql_payload([]))
     code, summary, _, _ = _run_watch_pr(fake_gh)
     assert code == 4
     assert "conflict" in summary.lower()
@@ -154,9 +162,380 @@ def test_pr_dirty_exits_4_immediately(fake_gh):
 def test_pr_behind_exits_4_immediately(fake_gh):
     fake_gh.set_get("/repos/o/r/pulls/1",
                      _pr_meta(mergeable_state="behind"))
+    fake_gh.queue_graphql(_graphql_payload([]))
     code, summary, _, _ = _run_watch_pr(fake_gh)
     assert code == 4
     assert "behind" in summary.lower()
+
+
+# Fresh push: PR lags its branch, CI not registered yet =====
+
+
+def test_no_checks_yet_waits_for_ci_to_register(fake_gh):
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    fake_gh.queue_graphql(
+        _graphql_payload([]),
+        _graphql_payload([]),
+        _graphql_payload([_node("build", status="IN_PROGRESS", conclusion=None)]),
+        _graphql_payload([_node("build", status="COMPLETED", conclusion="SUCCESS")]),
+    )
+    code, summary, _, _ = _run_watch_pr(fake_gh, interval=5.0)
+    assert code == 0
+    assert "Passed: build" in summary
+
+
+def test_no_checks_registered_exits_4_after_stalled_timeout(fake_gh):
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    fake_gh.queue_graphql(*[_graphql_payload([], head_sha="abcdef123") for _ in range(100)])
+    code, summary, _, clock = _run_watch_pr(fake_gh, interval=10.0, stalled_timeout=60.0)
+    assert code == 4
+    assert "no productive ci" in summary.lower()
+    assert "No checks registered for abcdef1 within 60s" in summary
+    assert 60.0 < clock.now() <= 80.0
+
+
+def test_pr_lagging_branch_tip_ignores_stale_head_checks(fake_gh):
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    fake_gh.queue_graphql(
+        # PR still shows the old head, whose checks failed.
+        _graphql_payload([_node("build", conclusion="FAILURE")],
+                         head_sha="old", branch_tip="new"),
+        _graphql_payload([_node("build", conclusion="FAILURE")],
+                         head_sha="old", branch_tip="new"),
+        # PR catches up; the new head's checks pass.
+        _graphql_payload([_node("build", status="IN_PROGRESS", conclusion=None)],
+                         head_sha="new"),
+        _graphql_payload([_node("build", conclusion="SUCCESS")], head_sha="new"),
+    )
+    code, summary, _, _ = _run_watch_pr(fake_gh, interval=5.0)
+    assert code == 0
+    assert "Passed: build" in summary
+
+
+def _lagging_then_green_graphql(fake_gh):
+    fake_gh.queue_graphql(
+        _graphql_payload([_node("build", conclusion="FAILURE")],
+                         head_sha="old", branch_tip="new"),
+        _graphql_payload([_node("build", status="IN_PROGRESS", conclusion=None)],
+                         head_sha="new"),
+        _graphql_payload([_node("build", conclusion="SUCCESS")], head_sha="new"),
+    )
+
+
+def test_pr_lagging_branch_tip_ignores_stale_conflict(fake_gh):
+    fake_gh.queue_get(
+        "/repos/o/r/pulls/1",
+        _pr_meta(mergeable=False, mergeable_state="dirty", head_sha="old"),
+        _pr_meta(head_sha="new"),
+        _pr_meta(head_sha="new"),
+    )
+    _lagging_then_green_graphql(fake_gh)
+    code, summary, _, _ = _run_watch_pr(fake_gh, interval=5.0)
+    assert code == 0
+
+
+def test_pr_lagging_branch_tip_ignores_stale_behind(fake_gh):
+    fake_gh.queue_get(
+        "/repos/o/r/pulls/1",
+        _pr_meta(mergeable_state="behind", head_sha="old"),
+        _pr_meta(head_sha="new"),
+        _pr_meta(head_sha="new"),
+    )
+    _lagging_then_green_graphql(fake_gh)
+    code, _, _, _ = _run_watch_pr(fake_gh, interval=5.0)
+    assert code == 0
+
+
+def test_conflict_held_while_graphql_head_lags_rest(fake_gh):
+    fake_gh.queue_get(
+        "/repos/o/r/pulls/1",
+        _pr_meta(mergeable=False, mergeable_state="dirty", head_sha="new"),
+        _pr_meta(head_sha="new"),
+        _pr_meta(head_sha="new"),
+    )
+    _lagging_then_green_graphql(fake_gh)
+    code, _, _, _ = _run_watch_pr(fake_gh, interval=5.0)
+    assert code == 0
+
+
+def test_conflict_held_while_rest_head_unknown(fake_gh):
+    fake_gh.queue_get(
+        "/repos/o/r/pulls/1",
+        _pr_meta(mergeable=False, mergeable_state="dirty", head_sha=None),
+        _pr_meta(),
+        _pr_meta(),
+    )
+    fake_gh.queue_graphql(
+        _graphql_payload([_node("build", conclusion="SUCCESS")]),
+        _graphql_payload([_node("build", conclusion="SUCCESS")]),
+    )
+    code, _, _, clock = _run_watch_pr(fake_gh, interval=5.0)
+    assert code == 0
+    assert clock.now() == 5.0
+
+
+def test_closed_while_lagging_exits_4(fake_gh):
+    fake_gh.queue_get("/repos/o/r/pulls/1", _pr_meta(head_sha="old"),
+                      _pr_meta(state="closed", head_sha="old"))
+    fake_gh.queue_graphql(
+        _graphql_payload([], head_sha="old", branch_tip="new"),
+        _graphql_payload([], head_sha="old", branch_tip="new"),
+    )
+    code, summary, _, _ = _run_watch_pr(fake_gh, interval=5.0)
+    assert code == 4
+    assert "closed" in summary.lower()
+
+
+def test_initial_unknown_pr_head_with_known_tip_waits(fake_gh):
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta(head_sha=None))
+    fake_gh.queue_graphql(
+        _graphql_payload([_node("build", conclusion="FAILURE")],
+                         head_sha=None, branch_tip="new"),
+        _graphql_payload([_node("build", conclusion="SUCCESS")], head_sha="new"),
+        _graphql_payload([_node("build", conclusion="SUCCESS")], head_sha="new"),
+    )
+    code, _, stderr, _ = _run_watch_pr(fake_gh, interval=5.0)
+    assert code == 0
+    assert "PR behind its branch" in stderr
+
+
+def test_pr_synced_then_no_checks_exits_4_after_window(fake_gh):
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    fake_gh.queue_graphql(
+        _graphql_payload([_node("build", conclusion="FAILURE")],
+                         head_sha="old", branch_tip="new"),
+        *[_graphql_payload([], head_sha="new") for _ in range(20)],
+    )
+    code, summary, _, clock = _run_watch_pr(fake_gh, interval=10.0, stalled_timeout=60.0)
+    assert code == 4
+    assert "No checks registered for new within 60s" in summary
+    # The window starts when the PR synced (t=10), not when watch started.
+    assert clock.now() == 80.0
+
+
+def test_pr_with_deleted_branch_uses_pr_head(fake_gh):
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    payload = _graphql_payload([_node("build", conclusion="SUCCESS")])
+    payload["repository"]["pullRequest"]["headRef"] = None
+    fake_gh.queue_graphql(payload)
+    code, _, _, _ = _run_watch_pr(fake_gh)
+    assert code == 0
+
+
+def _job(name, *, status="completed", conclusion="success", run_id=5):
+    return {"id": 1, "name": name, "status": status, "conclusion": conclusion,
+            "html_url": "u", "run_id": run_id}
+
+
+_RUNS = "/repos/o/r/actions/workflows/ci.yml/runs"
+
+
+def _watch_workflow(fake_gh, *, interval=5.0, stalled_timeout=60.0, clock=None):
+    clock = clock or FakeClock()
+    code, summary = run_watch(
+        target=WorkflowTarget(owner="o", repo="r", host="github.com",
+                              workflow_path="ci.yml", branch="main"),
+        ignore_rules=[], interval=interval, timeout=0.0, stalled_timeout=stalled_timeout,
+        clock=clock, stderr=io.StringIO(),
+        gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+    )
+    return code, summary, clock
+
+
+def test_workflow_target_waits_for_run_on_branch_tip(fake_gh):
+    fake_gh.set_get("/repos/o/r/branches/main", {"commit": {"sha": "new"}})
+    fake_gh.queue_get(
+        f"{_RUNS}?branch=main&head_sha=new&per_page=100",
+        {"workflow_runs": []},
+        {"workflow_runs": [{"id": 5, "name": "CI", "head_repository": {"full_name": "o/r"}, "head_sha": "new"}]},
+    )
+    fake_gh.set_get("/repos/o/r/actions/runs/5/jobs", {"jobs": [_job("build")]})
+    code, summary, _ = _watch_workflow(fake_gh)
+    assert code == 0
+    assert "Passed: build" in summary
+
+
+def test_workflow_target_without_run_exits_4_after_window(fake_gh):
+    fake_gh.set_get("/repos/o/r/branches/main", {"commit": {"sha": "new"}})
+    fake_gh.set_get(f"{_RUNS}?branch=main&head_sha=new&per_page=100", {"workflow_runs": []})
+    code, summary, clock = _watch_workflow(fake_gh, interval=10.0)
+    assert code == 4
+    assert "No checks registered for new within 60s" in summary
+    assert clock.now() == 70.0
+
+
+def test_workflow_run_without_jobs_yet_keeps_waiting(fake_gh):
+    fake_gh.set_get("/repos/o/r/branches/main", {"commit": {"sha": "new"}})
+    fake_gh.set_get(f"{_RUNS}?branch=main&head_sha=new&per_page=100",
+                    {"workflow_runs": [{"id": 5, "name": "CI", "head_repository": {"full_name": "o/r"}, "head_sha": "new",
+                                        "status": "queued", "conclusion": None}]})
+    fake_gh.queue_get("/repos/o/r/actions/runs/5/jobs",
+                      *[{"jobs": []}] * 10, {"jobs": [_job("build")]})
+    code, summary, clock = _watch_workflow(fake_gh, interval=10.0)
+    assert code == 0
+    assert clock.now() == 100.0
+
+
+def test_workflow_run_startup_failure_exits_3(fake_gh):
+    fake_gh.set_get("/repos/o/r/branches/main", {"commit": {"sha": "new"}})
+    fake_gh.set_get(f"{_RUNS}?branch=main&head_sha=new&per_page=100",
+                    {"workflow_runs": [{"id": 5, "name": "CI", "head_repository": {"full_name": "o/r"}, "head_sha": "new",
+                                        "status": "completed",
+                                        "conclusion": "startup_failure"}]})
+    fake_gh.set_get("/repos/o/r/actions/runs/5/jobs", {"jobs": []})
+    code, summary, clock = _watch_workflow(fake_gh)
+    assert code == 3
+    assert clock.now() == 0.0
+
+
+def test_workflow_run_completed_without_jobs_exits_4_immediately(fake_gh):
+    fake_gh.set_get("/repos/o/r/branches/main", {"commit": {"sha": "new"}})
+    fake_gh.set_get(f"{_RUNS}?branch=main&head_sha=new&per_page=100",
+                    {"workflow_runs": [{"id": 5, "name": "CI", "head_repository": {"full_name": "o/r"}, "head_sha": "new",
+                                        "status": "completed", "conclusion": "success"}]})
+    fake_gh.set_get("/repos/o/r/actions/runs/5/jobs", {"jobs": []})
+    code, summary, clock = _watch_workflow(fake_gh)
+    assert code == 4
+    assert "no productive ci" in summary.lower()
+    assert clock.now() == 0.0
+
+
+def test_timeout_while_lagging_omits_stale_head_checks(fake_gh):
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    fake_gh.queue_graphql(*[
+        _graphql_payload([_node("build", conclusion="FAILURE")],
+                         head_sha="old", branch_tip="new")
+        for _ in range(10)
+    ])
+    code, summary, stderr, _ = _run_watch_pr(fake_gh, interval=5.0, timeout=12.0)
+    assert code == 7
+    assert "build" not in summary
+    assert "Watching run" not in stderr
+
+
+def test_push_mid_watch_then_timeout_omits_stale_head_checks(fake_gh):
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    fake_gh.queue_graphql(
+        _graphql_payload([_node("build", status="IN_PROGRESS", conclusion=None)],
+                         head_sha="a"),
+        *[_graphql_payload([_node("build", status="IN_PROGRESS", conclusion=None)],
+                           head_sha="a", branch_tip="b")
+          for _ in range(10)],
+    )
+    code, summary, _, _ = _run_watch_pr(fake_gh, interval=5.0, timeout=12.0)
+    assert code == 7
+    assert "build" not in summary
+
+
+def test_null_pr_head_while_lagging_keeps_waiting(fake_gh):
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    fake_gh.queue_graphql(
+        _graphql_payload([_node("build", conclusion="FAILURE")],
+                         head_sha="old", branch_tip="new"),
+        _graphql_payload([_node("build", conclusion="FAILURE")],
+                         head_sha=None, branch_tip="new"),
+        _graphql_payload([_node("build", status="IN_PROGRESS", conclusion=None)],
+                         head_sha="new"),
+        _graphql_payload([_node("build", conclusion="SUCCESS")], head_sha="new"),
+    )
+    code, _, _, _ = _run_watch_pr(fake_gh, interval=5.0)
+    assert code == 0
+
+
+def test_completed_run_without_jobs_exits_4_immediately(fake_gh):
+    fake_gh.set_get("/repos/o/r/actions/runs/1234/jobs", {"jobs": []})
+    fake_gh.set_get("/repos/o/r/actions/runs/1234",
+                    {"id": 1234, "name": "CI", "status": "completed"})
+    clock = FakeClock()
+    code, summary = run_watch(
+        target=RunTarget(owner="o", repo="r", host="github.com", run_id=1234),
+        ignore_rules=[], interval=10.0, timeout=0.0, stalled_timeout=60.0,
+        clock=clock, stderr=io.StringIO(),
+        gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+    )
+    assert code == 4
+    assert clock.now() == 0.0
+
+
+def _watch_run(fake_gh, run, *jobs_responses, ignore_rules=()):
+    fake_gh.set_get("/repos/o/r/actions/runs/1234", run)
+    fake_gh.queue_get("/repos/o/r/actions/runs/1234/jobs", *jobs_responses)
+    clock = FakeClock()
+    code, summary = run_watch(
+        target=RunTarget(owner="o", repo="r", host="github.com", run_id=1234),
+        ignore_rules=list(ignore_rules), interval=10.0, timeout=0.0, stalled_timeout=60.0,
+        clock=clock, stderr=io.StringIO(),
+        gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+    )
+    return code, summary, clock
+
+
+def test_run_target_without_jobs_yet_keeps_waiting(fake_gh):
+    code, summary, clock = _watch_run(
+        fake_gh, {"id": 1234, "name": "CI", "status": "queued", "conclusion": None},
+        *[{"jobs": []}] * 10, {"jobs": [_job("build")]},
+    )
+    assert code == 0
+    assert "Passed: build" in summary
+    assert clock.now() == 100.0
+
+
+def test_run_target_job_ignore_named_like_workflow_keeps_waiting(fake_gh):
+    code, summary, _ = _watch_run(
+        fake_gh, {"id": 1234, "name": "CI", "status": "queued", "conclusion": None},
+        {"jobs": []}, {"jobs": [_job("CI"), _job("build")]},
+        ignore_rules=[IgnoreRule(prefix="job", name="CI")],
+    )
+    assert code == 0
+    assert "Passed: build" in summary
+
+
+def test_run_target_startup_failure_exits_3(fake_gh):
+    code, summary, clock = _watch_run(
+        fake_gh, {"id": 1234, "name": "CI", "status": "completed",
+                  "conclusion": "startup_failure"},
+        {"jobs": []},
+    )
+    assert code == 3
+    assert clock.now() == 0.0
+    assert 'workflow "CI" startup_failure' in summary
+    assert '--ignore workflow:CI' in summary
+
+
+def test_only_ignored_checks_exits_4_after_window(fake_gh):
+    fake_gh.set_get("/repos/o/r/pulls/1", _pr_meta())
+    fake_gh.queue_graphql(*[_graphql_payload([_node("lint", conclusion="SUCCESS")])
+                            for _ in range(20)])
+    code, summary, _, clock = _run_watch_pr(
+        fake_gh, interval=10.0, ignore_rules=[IgnoreRule(prefix="job", name="lint")],
+    )
+    assert code == 4
+    assert "Only ignored checks registered for sha1 within 60s" in summary
+    assert clock.now() == 70.0
+
+
+def test_workflow_target_push_mid_watch_restarts_registration_wait(fake_gh):
+    fake_gh.set_get(f"{_RUNS}?branch=main&head_sha=a&per_page=100",
+                    {"workflow_runs": [{"id": 4, "name": "CI", "head_repository": {"full_name": "o/r"}, "head_sha": "a"}]})
+    fake_gh.queue_get("/repos/o/r/branches/main",
+                      *[{"commit": {"sha": "a"}}] * 9, *[{"commit": {"sha": "b"}}] * 2)
+    fake_gh.queue_get(
+        f"{_RUNS}?branch=main&head_sha=b&per_page=100",
+        {"workflow_runs": []},
+        {"workflow_runs": [{"id": 5, "name": "CI", "head_repository": {"full_name": "o/r"}, "head_sha": "b"}]},
+    )
+    fake_gh.set_get("/repos/o/r/actions/runs/4/jobs",
+                    {"jobs": [_job("build", status="in_progress", conclusion=None, run_id=4)]})
+    fake_gh.set_get("/repos/o/r/actions/runs/5/jobs", {"jobs": [_job("build")]})
+    code, summary = run_watch(
+        target=WorkflowTarget(owner="o", repo="r", host="github.com",
+                              workflow_path="ci.yml", branch="main"),
+        ignore_rules=[], interval=10.0, timeout=0.0, stalled_timeout=60.0,
+        clock=FakeClock(), stderr=io.StringIO(),
+        gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+    )
+    assert code == 0
+    assert "Passed: build" in summary
 
 
 # Looping =====

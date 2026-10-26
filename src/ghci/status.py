@@ -14,7 +14,7 @@ from ghci.colors import (
     ensure_palette,
 )
 from ghci.conflicts import ConflictOutcome, assess_pr, message_for, result_style_for
-from ghci.ignore import IgnoreRule, matches as ignore_matches
+from ghci.ignore import IgnoreRule, ignore_prefix, matches as ignore_matches
 
 
 # evaluate_snapshot =====
@@ -55,7 +55,8 @@ def evaluate_snapshot(
     failed_items = [it for it in active if classify_conclusion(it.conclusion) == Outcome.FAILED]
     if failed_items:
         first_failed = failed_items[0]
-        result_line = f'Result: red CI (job "{first_failed.name}" {first_failed.conclusion})'
+        result_line = (f'Result: red CI ({ignore_prefix(first_failed)} '
+                       f'"{first_failed.name}" {first_failed.conclusion})')
         return 3, format_summary(
             items, ignored, result_line=result_line,
             result_style=_ResultStyle.RED, palette=p,

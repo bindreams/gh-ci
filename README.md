@@ -42,7 +42,7 @@ Run `gh-ci <subcommand> --help` for full details, including the exit-code table.
 - PR URL: `https://github.com/<owner>/<repo>/pull/<num>`
 - Run URL: `https://github.com/<owner>/<repo>/actions/runs/<run_id>` (optional `/attempts/<n>`)
 - Job URL: `https://github.com/<owner>/<repo>/actions/runs/<run_id>/job/<job_id>` (or `/jobs/<job_id>`)
-- Workflow URL: `https://github.com/<owner>/<repo>/actions/workflows/<name>.yml` (optional `?branch=<b>`)
+- Workflow URL: `https://github.com/<owner>/<repo>/actions/workflows/<name>.yml` (optional `?branch=<b>`). Selects the run for the current tip of `<owner>/<repo>`'s branch (default: the default branch), never a fork PR's run on a same-named branch; use the PR or run URL for those.
 
 GitHub Enterprise Server hosts are accepted; the host is plumbed through to `gh`.
 

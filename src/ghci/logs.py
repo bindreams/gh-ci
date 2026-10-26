@@ -10,12 +10,16 @@ from typing import Any, Callable, TextIO
 
 import platformdirs
 
-from ghci.checks import Outcome, classify_conclusion, fetch_pr_checks
+from ghci.checks import (
+    Outcome,
+    classify_conclusion,
+    fetch_pr_checks,
+    fetch_workflow_tip_run_or_raise,
+)
 from ghci.colors import Palette, ensure_palette
 from ghci.gh import GhError, gh_api_download, gh_api_get, gh_api_graphql, parse_http_status
 from ghci.ignore import IgnoreRule
 from ghci.target import (
-    EmptyTargetError,
     JobTarget,
     PrTarget,
     ResolvedTarget,
@@ -187,25 +191,11 @@ def _resolve_runs_for_target(
             "run_url": run.get("html_url") or f"https://github.com/{target.owner}/{target.repo}/actions/runs/{target.run_id}",
         }]
     if isinstance(target, WorkflowTarget):
-        from urllib.parse import quote
-        data = gh_get(
-            f"/repos/{target.owner}/{target.repo}/actions/workflows/"
-            f"{quote(target.workflow_path)}/runs"
-            f"?branch={quote(target.branch)}&per_page=1",
-            host=host,
+        # Raises EmptyTargetError (exit 2) if the branch tip has no run yet.
+        run = fetch_workflow_tip_run_or_raise(
+            target.owner, target.repo, target.workflow_path,
+            branch=target.branch, host=host, gh_get=gh_get,
         )
-        runs = data.get("workflow_runs", [])
-        if not runs:
-            # Recognized target but no runs: surface as EmptyTargetError so
-            # cli.py returns exit 2 with a clear message instead of silently
-            # treating this as "no logs to download" (exit 0).
-            raise EmptyTargetError(
-                f"Workflow {target.workflow_path!r} in "
-                f"{target.owner}/{target.repo} has no runs on branch "
-                f"{target.branch!r} (recognized target, but empty). "
-                f"Check the workflow filename and branch, or trigger a run."
-            )
-        run = runs[0]
         jobs_data = gh_get(
             f"/repos/{target.owner}/{target.repo}/actions/runs/{run['id']}/jobs",
             host=host, paginate=True,

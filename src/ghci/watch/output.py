@@ -77,6 +77,34 @@ def format_force_push_line(
     return f"{ts}  {phrase} — now watching SHA {short}"
 
 
+def format_pr_lag_line(
+    *,
+    when: datetime,
+    pr_sha: str,
+    branch_sha: str,
+    palette: Palette | None = None,
+) -> str:
+    p = ensure_palette(palette)
+    ts = p.style(_fmt_time(when), dim=True)
+    phrase = p.style("PR behind its branch", color="yellow")
+    return (
+        f"{ts}  {phrase} — PR shows {pr_sha[:7]}, branch is at {branch_sha[:7]}; "
+        f"waiting for GitHub to sync"
+    )
+
+
+def format_pr_synced_line(
+    *,
+    when: datetime,
+    new_sha: str,
+    palette: Palette | None = None,
+) -> str:
+    p = ensure_palette(palette)
+    ts = p.style(_fmt_time(when), dim=True)
+    short = new_sha[:7] if new_sha else "?"
+    return f"{ts}  PR synced — now watching SHA {short}"
+
+
 def format_resolution_line(text: str) -> str:
     # No-op for now; provided as a seam in case future work wants to enrich it.
     return text

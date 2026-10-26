@@ -8,8 +8,13 @@ from ghci.checks import (
     fetch_pr_checks,
     fetch_pr_meta,
     fetch_run_jobs,
-    fetch_workflow_latest_run,
+    fetch_branch_tip,
+    fetch_workflow_run_for_sha,
 )
+from ghci.gh import GhError
+from ghci.target import EmptyTargetError
+
+import pytest
 
 
 # classify_conclusion =====
@@ -338,36 +343,85 @@ def test_fetch_job_single():
     assert item.kind == "actions"
 
 
-# fetch_workflow_latest_run =====
+# Workflow run lookup =====
 
 
-def test_fetch_workflow_latest_run_uses_branch_filter():
+def _own(run_id, repo="foo/bar"):
+    return {"id": run_id, "head_sha": "abc", "head_repository": {"full_name": repo}}
+
+
+def test_fetch_workflow_run_for_sha_filters_by_branch_and_sha():
     captured = {}
 
     def gh_get(path, *, host=None, paginate=False):
-        captured["path"] = path
-        return {
-            "workflow_runs": [
-                {"id": 9001, "name": "CI Build", "head_branch": "main"},
-            ]
-        }
+        captured.update(path=path, paginate=paginate)
+        return {"workflow_runs": [_own(7)]}
 
-    run = fetch_workflow_latest_run(
-        "foo", "bar", "ci.yml", branch="main", gh_get=gh_get
+    run = fetch_workflow_run_for_sha(
+        "foo", "bar", "ci.yml", branch="feat/x", head_sha="abc", gh_get=gh_get
     )
-    assert run["id"] == 9001
-    assert "/repos/foo/bar/actions/workflows/ci.yml/runs" in captured["path"]
-    assert "branch=main" in captured["path"]
+    assert run["id"] == 7
+    assert captured["path"] == (
+        "/repos/foo/bar/actions/workflows/ci.yml/runs"
+        "?branch=feat/x&head_sha=abc&per_page=100"
+    )
+    assert captured["paginate"] is True
 
 
-def test_fetch_workflow_latest_run_empty_returns_none():
+def test_fetch_workflow_run_for_sha_skips_fork_runs():
+    """A fork PR from a same-named branch at the same commit matches both filters."""
+    runs = [_own(8, repo="someone/bar"), {**_own(9), "head_repository": None}, _own(7)]
+
     def gh_get(path, *, host=None, paginate=False):
-        return {"workflow_runs": []}
+        return {"workflow_runs": runs}
 
-    run = fetch_workflow_latest_run(
-        "foo", "bar", "ci.yml", branch="main", gh_get=gh_get
+    run = fetch_workflow_run_for_sha(
+        "foo", "bar", "ci.yml", branch="main", head_sha="abc", gh_get=gh_get
     )
-    assert run is None
+    assert run["id"] == 7
+
+
+def test_fetch_workflow_run_for_sha_only_fork_runs_returns_none():
+    def gh_get(path, *, host=None, paginate=False):
+        return {"workflow_runs": [_own(8, repo="someone/bar")]}
+
+    assert fetch_workflow_run_for_sha(
+        "foo", "bar", "ci.yml", branch="main", head_sha="abc", gh_get=gh_get
+    ) is None
+
+
+def test_fetch_workflow_run_for_sha_repo_match_ignores_case():
+    def gh_get(path, *, host=None, paginate=False):
+        return {"workflow_runs": [_own(7, repo="Foo/Bar")]}
+
+    run = fetch_workflow_run_for_sha(
+        "foo", "bar", "ci.yml", branch="main", head_sha="abc", gh_get=gh_get
+    )
+    assert run["id"] == 7
+
+
+def test_fetch_branch_tip_returns_commit_sha():
+    def gh_get(path, *, host=None, paginate=False):
+        assert path == "/repos/foo/bar/branches/feat/x"
+        return {"commit": {"sha": "abc"}}
+
+    assert fetch_branch_tip("foo", "bar", "feat/x", gh_get=gh_get) == "abc"
+
+
+def test_fetch_branch_tip_missing_branch_raises_empty_target():
+    def gh_get(path, *, host=None, paginate=False):
+        raise GhError(returncode=1, stderr="gh: Branch not found (HTTP 404)")
+
+    with pytest.raises(EmptyTargetError, match="not found"):
+        fetch_branch_tip("foo", "bar", "main", gh_get=gh_get)
+
+
+def test_fetch_branch_tip_other_errors_propagate():
+    def gh_get(path, *, host=None, paginate=False):
+        raise GhError(returncode=1, stderr="gh: Server Error (HTTP 502)")
+
+    with pytest.raises(GhError):
+        fetch_branch_tip("foo", "bar", "main", gh_get=gh_get)
 
 
 # fetch_pr_checks — pending check-suite placeholders =====

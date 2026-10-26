@@ -194,68 +194,96 @@ def test_gh_missing_exits_6(fake_gh):
     assert "gh" in err.getvalue()
 
 
-# Empty WorkflowTarget (recognized URL but no runs on branch) → exit 2 =====
+# RunTarget with no jobs yet =====
 
 
-def test_status_empty_workflow_exits_2(fake_gh):
-    """Workflow URL parses fine, but the workflow has 0 runs on the
-    requested branch. status must exit 2 with a clear "recognized-but-empty"
-    message — not exit 4 ("no productive CI ran")."""
-    # Default branch lookup (no ?branch= in URL).
+def _status_run_without_jobs(fake_gh, run):
+    fake_gh.set_get("/repos/o/r/actions/runs/100", {"id": 100, "name": "CI", **run})
+    fake_gh.set_get("/repos/o/r/actions/runs/100/jobs", {"jobs": []})
+    out = io.StringIO()
+    code = main(["status", "https://github.com/o/r/actions/runs/100"],
+                 gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+                 stdout=out, stderr=io.StringIO())
+    return code, out.getvalue()
+
+
+def test_status_run_without_jobs_yet_is_in_progress(fake_gh):
+    code, out = _status_run_without_jobs(fake_gh, {"status": "queued", "conclusion": None})
+    assert code == ExitCode.TIMEOUT_OR_IN_PROGRESS
+    assert "CI" in out
+
+
+def test_status_run_startup_failure_exits_3(fake_gh):
+    code, out = _status_run_without_jobs(
+        fake_gh, {"status": "completed", "conclusion": "startup_failure"})
+    assert code == 3
+    assert 'workflow "CI" startup_failure' in out
+
+
+# WorkflowTarget resolves to the run for the branch tip's commit =====
+
+
+_WF_RUNS = "/repos/o/r/actions/workflows/ci.yml/runs"
+
+
+def _set_tip_without_run(fake_gh):
     fake_gh.set_get("/repos/o/r", {"default_branch": "main"})
-    # Workflow runs query returns zero runs.
-    fake_gh.set_get(
-        "/repos/o/r/actions/workflows/ci.yml/runs?branch=main&per_page=1",
-        {"workflow_runs": []},
-    )
+    fake_gh.set_get("/repos/o/r/branches/main", {"commit": {"sha": "abc1234def"}})
+    fake_gh.set_get(f"{_WF_RUNS}?branch=main&head_sha=abc1234def&per_page=100",
+                    {"workflow_runs": []})
+
+
+def _set_tip_run_and_newer_fork_run(fake_gh):
+    """A fork PR from someone/main at o/r's main tip matches both API filters and
+    is newest; it failed. o/r's own run for the tip passed."""
+    fake_gh.set_get("/repos/o/r", {"default_branch": "main"})
+    fake_gh.set_get("/repos/o/r/branches/main", {"commit": {"sha": "tip1"}})
+    fake_gh.set_get(f"{_WF_RUNS}?branch=main&head_sha=tip1&per_page=100", {"workflow_runs": [
+        {"id": 9, "name": "CI", "head_repository": {"full_name": "someone/r"},
+         "head_sha": "tip1", "html_url": "u"},
+        {"id": 5, "name": "CI", "head_repository": {"full_name": "o/r"},
+         "head_sha": "tip1", "html_url": "u"},
+    ]})
+    fake_gh.set_get("/repos/o/r/actions/runs/9/jobs", {"jobs": [
+        {"id": 90, "name": "test", "status": "completed", "conclusion": "failure",
+         "html_url": "u", "run_id": 9}]})
+    fake_gh.set_get("/repos/o/r/actions/runs/5/jobs", {"jobs": [
+        {"id": 50, "name": "test", "status": "completed", "conclusion": "success",
+         "html_url": "u", "run_id": 5}]})
+
+
+def test_status_workflow_without_tip_run_exits_2(fake_gh):
+    _set_tip_without_run(fake_gh)
     err = io.StringIO()
+    code = main(
+        ["status", "https://github.com/o/r/actions/workflows/ci.yml"],
+        gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+        stdout=io.StringIO(), stderr=err,
+    )
+    assert code == 2
+    assert "ci.yml" in err.getvalue()
+    assert "no run yet" in err.getvalue().lower()
+    assert "abc1234" in err.getvalue()
+
+
+def test_status_workflow_uses_tip_run_not_newest_fork_run(fake_gh):
+    _set_tip_run_and_newer_fork_run(fake_gh)
     out = io.StringIO()
     code = main(
         ["status", "https://github.com/o/r/actions/workflows/ci.yml"],
         gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
-        stdout=out, stderr=err,
+        stdout=out, stderr=io.StringIO(),
     )
-    assert code == 2
-    msg = err.getvalue().lower()
-    assert "ci.yml" in err.getvalue()
-    assert "no runs" in msg or "empty" in msg
-    assert "main" in err.getvalue()
+    assert code == 0
+    assert "Passed: test" in out.getvalue()
 
 
-def test_watch_empty_workflow_exits_2(fake_gh):
-    """Same recognized-but-empty case for watch — exit 2, not exit 4."""
-    fake_gh.set_get("/repos/o/r", {"default_branch": "main"})
-    fake_gh.set_get(
-        "/repos/o/r/actions/workflows/ci.yml/runs?branch=main&per_page=1",
-        {"workflow_runs": []},
-    )
-    err = io.StringIO()
-    out = io.StringIO()
-    code = main(
-        ["watch", "https://github.com/o/r/actions/workflows/ci.yml",
-         "--interval", "1s", "--timeout", "1s"],
-        gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
-        stdout=out, stderr=err,
-    )
-    assert code == 2
-    msg = err.getvalue().lower()
-    assert "ci.yml" in err.getvalue()
-    assert "no runs" in msg or "empty" in msg
-    assert "main" in err.getvalue()
-
-
-def test_logs_empty_workflow_exits_2(fake_gh, tmp_path):
-    """Same recognized-but-empty case for logs — exit 2 with clear message,
-    not silent exit 0."""
-    fake_gh.set_get("/repos/o/r", {"default_branch": "main"})
-    fake_gh.set_get(
-        "/repos/o/r/actions/workflows/ci.yml/runs?branch=main&per_page=1",
-        {"workflow_runs": []},
-    )
+def test_logs_workflow_without_tip_run_exits_2(fake_gh, tmp_path):
+    _set_tip_without_run(fake_gh)
     err = io.StringIO()
 
     def fake_download(path, dest, *, host=None):
-        raise AssertionError("should not download anything for empty workflow")
+        raise AssertionError("should not download anything without a tip run")
 
     code = main(
         ["logs", "https://github.com/o/r/actions/workflows/ci.yml",
@@ -264,10 +292,51 @@ def test_logs_empty_workflow_exits_2(fake_gh, tmp_path):
         gh_download_fn=fake_download, stderr=err,
     )
     assert code == 2
-    msg = err.getvalue().lower()
-    assert "ci.yml" in err.getvalue()
-    assert "no runs" in msg or "empty" in msg
+    assert "no run yet" in err.getvalue().lower()
+    assert "abc1234" in err.getvalue()
+
+
+def test_logs_workflow_downloads_tip_run_not_newest_fork_run(fake_gh, tmp_path):
+    _set_tip_run_and_newer_fork_run(fake_gh)
+    downloaded = []
+
+    def fake_download(path, dest, *, host=None):
+        downloaded.append(path)
+        dest.write_bytes(b"log")
+        return 3
+
+    code = main(
+        ["logs", "https://github.com/o/r/actions/workflows/ci.yml",
+         "--output-dir", str(tmp_path)],
+        gh_get=fake_gh.gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+        gh_download_fn=fake_download, stderr=io.StringIO(),
+    )
+    assert code == 0
+    assert downloaded == ["/repos/o/r/actions/jobs/50/logs"]
+
+
+def test_watch_workflow_missing_branch_exits_2(fake_gh):
+    """watch exits 2 when the workflow target's branch does not exist."""
+    from ghci.gh import GhError
+
+    fake_gh.set_get("/repos/o/r", {"default_branch": "main"})
+
+    def gh_get(path, **kw):
+        if path == "/repos/o/r/branches/main":
+            raise GhError(returncode=1, stderr="gh: Branch not found (HTTP 404)")
+        return fake_gh.gh_get(path, **kw)
+
+    err = io.StringIO()
+    out = io.StringIO()
+    code = main(
+        ["watch", "https://github.com/o/r/actions/workflows/ci.yml",
+         "--interval", "1s", "--timeout", "1s"],
+        gh_get=gh_get, gh_graphql_fn=fake_gh.gh_graphql,
+        stdout=out, stderr=err,
+    )
+    assert code == 2
     assert "main" in err.getvalue()
+    assert "not found" in err.getvalue().lower()
 
 
 # Unexpected exception → exit 1 with clean message =====

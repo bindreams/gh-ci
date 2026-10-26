@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass
 
 import pytest
 
-from ghci.ignore import IgnoreParseError, IgnoreRule, matches, parse_ignore
+from ghci.ignore import IgnoreParseError, IgnoreRule, ignore_arg, ignore_prefix, matches, parse_ignore
 
 
 @dataclass
@@ -12,6 +13,7 @@ class _Item:
     kind: str
     name: str
     workflow_name: str | None = None
+    suite_placeholder: bool = False
 
 
 # parse_ignore =====
@@ -80,6 +82,45 @@ def test_matches_job_against_actions_item():
     rules = [IgnoreRule("job", "lint")]
     assert matches(_Item(kind="actions", name="lint", workflow_name="CI"), rules)
     assert not matches(_Item(kind="actions", name="build", workflow_name="CI"), rules)
+
+
+def test_matches_job_does_not_match_run_placeholder_named_like_the_job():
+    placeholder = _Item(kind="actions", name="CI", workflow_name="CI", suite_placeholder=True)
+    assert not matches(placeholder, [IgnoreRule("job", "CI")])
+    assert matches(placeholder, [IgnoreRule("workflow", "CI")])
+
+
+@pytest.mark.parametrize("item, prefix", [
+    (_Item(kind="actions", name="build", workflow_name="CI"), "job"),
+    (_Item(kind="actions", name="CI", workflow_name="CI", suite_placeholder=True), "workflow"),
+    (_Item(kind="check_run", name="codecov"), "check"),
+    (_Item(kind="status_context", name="ci/circle"), "check"),
+])
+def test_ignore_prefix_names_a_rule_that_matches_the_item(item, prefix):
+    assert ignore_prefix(item) == prefix
+    assert matches(item, [IgnoreRule(prefix, item.name)])
+
+
+_HOSTILE_NAMES = ["build", 'say "hi"', '"q"', 'a"', "$HOME", "`id`", "$(echo hi)",
+                  "trailing\\", "it's", "a:b c", "-x"]
+
+
+@pytest.mark.parametrize("name", _HOSTILE_NAMES)
+@pytest.mark.parametrize("kind, placeholder", [
+    ("actions", False), ("actions", True), ("check_run", False), ("status_context", False),
+])
+def test_ignore_arg_survives_the_shell_and_matches_the_item(name, kind, placeholder):
+    item = _Item(kind=kind, name=name, workflow_name=name if placeholder else "CI",
+                 suite_placeholder=placeholder)
+    args = shlex.split(ignore_arg(item))
+    assert len(args) == 1
+    assert matches(item, [parse_ignore(args[0])])
+
+
+def test_matches_workflow_matches_unnamed_run_placeholder_by_its_label():
+    placeholder = _Item(kind="actions", name="GitHub Actions workflow",
+                        workflow_name=None, suite_placeholder=True)
+    assert matches(placeholder, [IgnoreRule("workflow", "GitHub Actions workflow")])
 
 
 def test_matches_job_does_not_match_status_or_check_run():

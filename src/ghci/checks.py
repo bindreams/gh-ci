@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, Callable, Literal
 from urllib.parse import quote
 
-from ghci.gh import gh_api_get, gh_api_graphql
+from ghci.gh import GhError, gh_api_get, gh_api_graphql, parse_http_status
 
 
 CheckKind = Literal["actions", "check_run", "status_context"]
@@ -60,6 +60,7 @@ query($owner:String!, $repo:String!, $number:Int!, $cursor:String, $suiteCursor:
       state
       mergeable
       headRefOid
+      headRef { target { oid } }
       commits(last:1) {
         nodes {
           commit {
@@ -120,7 +121,9 @@ def fetch_pr_checks(
 ) -> tuple[list[CheckItem], dict[str, Any]]:
     """Fetch all CheckItems for a PR via paginated GraphQL.
 
-    Returns (items, pr_meta) where pr_meta has {state, mergeable, headRefOid}.
+    Returns (items, pr_meta) where pr_meta has {state, mergeable, headRefOid,
+    branchTipOid}. branchTipOid is the head branch's current commit (None if the
+    branch is gone).
     """
     items: list[CheckItem] = []
     suite_nodes: list[dict] = []
@@ -145,6 +148,7 @@ def fetch_pr_checks(
                 "state": pr.get("state"),
                 "mergeable": pr.get("mergeable"),
                 "headRefOid": pr.get("headRefOid"),
+                "branchTipOid": ((pr.get("headRef") or {}).get("target") or {}).get("oid"),
             }
         commit_nodes = pr.get("commits", {}).get("nodes", [])
         if not commit_nodes:
@@ -375,6 +379,29 @@ def fetch_run_jobs(
     return items
 
 
+def run_placeholder(run: dict) -> CheckItem:
+    """Stand-in for a workflow run with no jobs: in flight while the run is
+    pending, red if it failed (e.g. startup_failure), else skipped, since no
+    job did any work."""
+    status = str(run.get("status") or "queued").lower()
+    conclusion = _lower_or_none(run.get("conclusion"))
+    if status == _TERMINAL_SUITE_STATUS and classify_conclusion(conclusion) != Outcome.FAILED:
+        conclusion = "skipped"
+    return CheckItem(
+        kind="actions",
+        name=run.get("name") or "GitHub Actions workflow",
+        workflow_name=run.get("name"),
+        status=status,
+        conclusion=conclusion,
+        url=run.get("html_url"),
+        required=False,
+        check_run_id=None,
+        run_id=run.get("id"),
+        workflow_run_url=run.get("html_url"),
+        suite_placeholder=True,
+    )
+
+
 def fetch_job(
     owner: str,
     repo: str,
@@ -388,7 +415,55 @@ def fetch_job(
     return _job_dict_to_check_item(data, workflow_name=workflow_name)
 
 
-def fetch_workflow_latest_run(
+def fetch_workflow_run_for_sha(
+    owner: str,
+    repo: str,
+    workflow_path: str,
+    *,
+    branch: str,
+    head_sha: str,
+    host: str | None = None,
+    gh_get: Callable[..., Any] = gh_api_get,
+) -> dict | None:
+    """Newest run of the workflow for `branch` at `head_sha` in this repo, or None.
+
+    Fork PR runs from a same-named branch at the same commit pass both API
+    filters, so runs whose head repository isn't this one are skipped.
+    """
+    path = (
+        f"/repos/{owner}/{repo}/actions/workflows/{quote(workflow_path)}/runs"
+        f"?branch={quote(branch)}&head_sha={quote(head_sha)}&per_page=100"
+    )
+    data = gh_get(path, host=host, paginate=True)
+    this_repo = f"{owner}/{repo}".lower()
+    for run in data.get("workflow_runs", []):
+        head_repo = (run.get("head_repository") or {}).get("full_name") or ""
+        if head_repo.lower() == this_repo:
+            return run
+    return None
+
+
+def fetch_branch_tip(
+    owner: str,
+    repo: str,
+    branch: str,
+    *,
+    host: str | None = None,
+    gh_get: Callable[..., Any] = gh_api_get,
+) -> str:
+    """Current commit of `branch`. Raises EmptyTargetError if the branch doesn't exist."""
+    from ghci.target import EmptyTargetError
+
+    try:
+        data = gh_get(f"/repos/{owner}/{repo}/branches/{quote(branch)}", host=host)
+    except GhError as e:
+        if parse_http_status(e.stderr) == 404:
+            raise EmptyTargetError(f"Branch {branch!r} not found in {owner}/{repo}.") from e
+        raise
+    return data["commit"]["sha"]
+
+
+def fetch_workflow_tip_run(
     owner: str,
     repo: str,
     workflow_path: str,
@@ -396,17 +471,21 @@ def fetch_workflow_latest_run(
     branch: str,
     host: str | None = None,
     gh_get: Callable[..., Any] = gh_api_get,
-) -> dict | None:
-    path = (
-        f"/repos/{owner}/{repo}/actions/workflows/{quote(workflow_path)}/runs"
-        f"?branch={quote(branch)}&per_page=1"
+) -> tuple[str, dict | None]:
+    """(tip, run): `branch`'s current commit in this repo, and the workflow's run
+    for it (None until GitHub creates one).
+
+    Keying on the tip skips runs for older commits and fork PR runs, which match
+    `?branch=` by name alone. Raises EmptyTargetError if the branch doesn't exist.
+    """
+    tip = fetch_branch_tip(owner, repo, branch, host=host, gh_get=gh_get)
+    run = fetch_workflow_run_for_sha(
+        owner, repo, workflow_path, branch=branch, head_sha=tip, host=host, gh_get=gh_get,
     )
-    data = gh_get(path, host=host)
-    runs = data.get("workflow_runs", [])
-    return runs[0] if runs else None
+    return tip, run
 
 
-def fetch_workflow_latest_run_or_raise(
+def fetch_workflow_tip_run_or_raise(
     owner: str,
     repo: str,
     workflow_path: str,
@@ -415,24 +494,17 @@ def fetch_workflow_latest_run_or_raise(
     host: str | None = None,
     gh_get: Callable[..., Any] = gh_api_get,
 ) -> dict:
-    """Like fetch_workflow_latest_run but raises EmptyTargetError if no runs.
-
-    Used to convert the "recognized-but-empty" workflow target case into a
-    distinct error path (CLI exit 2) instead of silently returning empty
-    item lists that downstream code misclassifies as "no productive CI ran".
-    """
-    # Local import to avoid a module-level cycle: target.py imports gh, and
-    # checks.py is widely imported.
+    """Like fetch_workflow_tip_run, but raises EmptyTargetError (CLI exit 2) if
+    the tip has no run yet."""
     from ghci.target import EmptyTargetError
 
-    run = fetch_workflow_latest_run(
+    tip, run = fetch_workflow_tip_run(
         owner, repo, workflow_path, branch=branch, host=host, gh_get=gh_get,
     )
     if run is None:
         raise EmptyTargetError(
-            f"Workflow {workflow_path!r} in {owner}/{repo} has no runs on "
-            f"branch {branch!r} (recognized target, but empty). "
-            f"Check the workflow filename and branch, or trigger a run."
+            f"Workflow {workflow_path!r} in {owner}/{repo} has no run yet for "
+            f"branch {branch!r} at {tip[:7]}. `gh-ci watch` waits for it."
         )
     return run
 
