@@ -10,7 +10,7 @@ When verifying CI on a PR or run, **always** use `gh-ci`. Do not hand-roll polli
 ## Three subcommands
 
 - `gh-ci status <target>` — single snapshot; never blocks. Use this first.
-- `gh-ci watch <target>` — blocks until decisive. Always pass `--timeout` if you have a budget; default is 30m.
+- `gh-ci watch <target>` — blocks until decisive. Always pass `--timeout` if you have a budget; default is 30m. Safe to run right after `git push`; it waits for GitHub to register the new commit's CI (bounded by `--stalled-timeout`).
 - `gh-ci logs <target>` — downloads all job logs (including in-progress) to `<download dir>/gh-ci-<run_id>-<ts>/`. Paths print on stderr. Read `manifest.json` to know which are partial or truncated.
 
 ## `<target>` is a GitHub URL

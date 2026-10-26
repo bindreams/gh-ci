@@ -38,7 +38,7 @@ _EXIT_CODE_HELP = (
     "Exit codes:\n"
     "  0   success\n"
     "  1   unexpected error\n"
-    "  2   bad CLI args / unrecognized target\n"
+    "  2   bad CLI args, unrecognized target, or workflow branch/run not found\n"
     "  3   CI failed — one or more non-ignored checks are red\n"
     "  4   PR conflict, closed PR, behind base, or no productive CI ran\n"
     "  5   required check stalled (watch only)\n"
@@ -209,7 +209,8 @@ def _fetch_for_status(target, host, gh_get, gh_graphql_fn):
         fetch_pr_meta,
         fetch_run,
         fetch_run_jobs,
-        fetch_workflow_latest_run_or_raise,
+        fetch_workflow_tip_run_or_raise,
+        run_placeholder,
     )
     from ghci.target import JobTarget, PrTarget, RunTarget, WorkflowTarget
 
@@ -225,22 +226,21 @@ def _fetch_for_status(target, host, gh_get, gh_graphql_fn):
         items = fetch_run_jobs(target.owner, target.repo, target.run_id,
                                 workflow_name=run.get("name"),
                                 host=host, gh_get=gh_get)
-        return items, None
+        return items or [run_placeholder(run)], None
     if isinstance(target, JobTarget):
         item = fetch_job(target.owner, target.repo, target.job_id,
                           workflow_name=None, host=host, gh_get=gh_get)
         return [item], None
     assert isinstance(target, WorkflowTarget)
-    # Raises EmptyTargetError if the workflow has no runs on the branch —
-    # caught at the main() entry to produce exit 2 with a clear message.
-    run = fetch_workflow_latest_run_or_raise(
+    # Raises EmptyTargetError (exit 2) if the branch tip has no run yet.
+    run = fetch_workflow_tip_run_or_raise(
         target.owner, target.repo, target.workflow_path,
         branch=target.branch, host=host, gh_get=gh_get,
     )
     items = fetch_run_jobs(target.owner, target.repo, run["id"],
                             workflow_name=run.get("name"),
                             host=host, gh_get=gh_get)
-    return items, None
+    return items or [run_placeholder(run)], None
 
 
 def _resolve_or_exit_2(url, *, gh_get, err, palette: Palette):
@@ -365,7 +365,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "How long the run may make no progress (no job running or changing "
             "state) while a required check is still unreported before exit 5 "
-            "fires (default 60s)."
+            "fires (default 60s). Also how long to wait for a fresh head to "
+            "register any checks before exit 4."
         ),
     )
 

@@ -15,9 +15,9 @@ class TargetParseError(ValueError):
 class EmptyTargetError(ValueError):
     """Raised when a target is recognized but has no runs/data to evaluate.
 
-    Currently triggered when a WorkflowTarget resolves to a workflow URL but
-    the workflow has no runs on the requested branch (e.g. brand-new workflow,
-    branch typo). The CLI surfaces this as exit code 2 with a clear message.
+    Triggered when a WorkflowTarget's branch doesn't exist, or (status, logs)
+    the branch tip has no run of the workflow yet. The CLI surfaces this as
+    exit code 2 with a clear message.
     """
 
 

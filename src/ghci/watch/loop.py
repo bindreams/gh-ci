@@ -13,13 +13,14 @@ from ghci.checks import (
     fetch_pr_meta,
     fetch_run,
     fetch_run_jobs,
-    fetch_workflow_latest_run_or_raise,
+    fetch_workflow_tip_run,
+    run_placeholder,
 )
 from ghci.clock import Clock, RealClock
 from ghci.colors import RESULT_STYLE_COLOR, Palette, _ResultStyle, ensure_palette
 from ghci.conflicts import ConflictOutcome, assess_pr, message_for, result_style_for
 from ghci.gh import gh_api_get, gh_api_graphql
-from ghci.ignore import IgnoreRule, matches as ignore_matches
+from ghci.ignore import IgnoreRule, ignore_arg, ignore_prefix, matches as ignore_matches
 from ghci.status import format_summary
 from ghci.target import (
     JobTarget,
@@ -29,7 +30,12 @@ from ghci.target import (
     WorkflowTarget,
     host_for_gh,
 )
-from ghci.watch.output import format_event_line, format_force_push_line
+from ghci.watch.output import (
+    format_event_line,
+    format_force_push_line,
+    format_pr_lag_line,
+    format_pr_synced_line,
+)
 from ghci.watch.state import (
     WatchState,
     initial_state,
@@ -67,10 +73,8 @@ def run_watch(
             target.owner, target.repo, target.pr_number,
             host=host, gh_get=gh_get,
         )
-        outcome = assess_pr(pr_meta)
-        if outcome in (ConflictOutcome.CLOSED, ConflictOutcome.DIRTY, ConflictOutcome.BEHIND):
-            return 4, _conflict_summary(outcome, target.pr_number, palette=p)
-        # OK or UNKNOWN — fall through.
+        if assess_pr(pr_meta) == ConflictOutcome.CLOSED:
+            return 4, _conflict_summary(ConflictOutcome.CLOSED, target.pr_number, palette=p)
 
     # Initial item fetch + resolution line.
     items, meta = _fetch_items(target, gh_get=gh_get, gh_graphql_fn=gh_graphql_fn, host=host)
@@ -85,23 +89,43 @@ def run_watch(
         rest_sha = rest_head.get("sha") if isinstance(rest_head, dict) else None
         if rest_sha:
             head_sha = rest_sha
+
+    # The PR can still show the pre-push head, whose checks say nothing about
+    # the push: hold every verdict until it matches the branch tip. A None head
+    # SHA makes the first synced tick re-baseline.
+    lagging = _pr_lag(meta, head_sha)
+    holding = lagging is not None
+    if lagging is not None:
+        items, head_sha = [], lagging[1]
+    elif pr_meta is not None:
+        conflict = _current_conflict(pr_meta, meta)
+        if isinstance(conflict, ConflictOutcome):
+            return 4, _conflict_summary(conflict, target.pr_number, palette=p)
+        holding = conflict == _HOLD
     resolution = _resolution_line(target, head_sha, items, ignore_rules)
     print(p.style(resolution, dim=True), file=err, flush=True)
+    if lagging is not None:
+        _print_lag(lagging, palette=p, err=err)
+    state = initial_state(items, head_sha=head_sha if lagging is None else None)
 
-    state = initial_state(items, head_sha=head_sha)
+    start_time = clk.now()
+    # Anchors the no-checks-registered wait. Run and job targets already
+    # exist, so nothing registers late.
+    head_since = start_time
+    registers_late = isinstance(target, (PrTarget, WorkflowTarget))
 
     # Initial-snapshot exit conditions (no stalled detection on first snapshot —
     # there's no prior tick to compare against).
-    decision = _evaluate_exit(
-        state, ignore_rules=ignore_rules, now=clk.now(),
-        stalled_timeout=None,
-        timed_out=False,
-        palette=p,
-    )
-    if decision is not None:
-        return decision
-
-    start_time = clk.now()
+    if not holding:
+        decision = _evaluate_exit(
+            state, ignore_rules=ignore_rules, now=clk.now(),
+            stalled_timeout=None,
+            awaiting_checks_since=head_since if registers_late else None,
+            timed_out=False,
+            palette=p,
+        )
+        if decision is not None:
+            return decision
 
     while True:
         clk.sleep(interval)
@@ -112,13 +136,32 @@ def run_watch(
                 target.owner, target.repo, target.pr_number,
                 host=host, gh_get=gh_get,
             )
-            outcome = assess_pr(pr_meta)
-            if outcome in (ConflictOutcome.CLOSED, ConflictOutcome.DIRTY, ConflictOutcome.BEHIND):
-                return 4, _conflict_summary(outcome, target.pr_number, palette=p)
+            if assess_pr(pr_meta) == ConflictOutcome.CLOSED:
+                return 4, _conflict_summary(ConflictOutcome.CLOSED, target.pr_number, palette=p)
 
         # Refetch.
         items, meta = _fetch_items(target, gh_get=gh_get, gh_graphql_fn=gh_graphql_fn, host=host)
         new_head_sha = meta.get("headRefOid") if meta else None
+
+        # A transient null head SHA proves nothing, so judge by the last known one.
+        lag = _pr_lag(meta, new_head_sha if new_head_sha is not None else state.head_sha)
+        if lag is not None:
+            if lagging is None:
+                lagging = lag
+                _print_lag(lagging, palette=p, err=err)
+                state = initial_state([])
+            if timeout > 0 and (clk.now() - start_time) > timeout:
+                return _timeout_summary(state, ignore_rules, palette=p)
+            continue
+
+        if pr_meta is not None:
+            conflict = _current_conflict(pr_meta, meta)
+            if isinstance(conflict, ConflictOutcome):
+                return 4, _conflict_summary(conflict, target.pr_number, palette=p)
+            if conflict == _HOLD:
+                if timeout > 0 and (clk.now() - start_time) > timeout:
+                    return _timeout_summary(state, ignore_rules, palette=p)
+                continue
 
         now = clk.now()
         state, events, force_pushed = update_state(
@@ -128,10 +171,10 @@ def run_watch(
 
         when = datetime.now()
         if force_pushed:
-            print(
-                format_force_push_line(when=when, new_sha=new_head_sha or "?", palette=p),
-                file=err, flush=True,
-            )
+            head_since = now
+            fmt = format_pr_synced_line if lagging is not None else format_force_push_line
+            lagging = None
+            print(fmt(when=when, new_sha=new_head_sha or "?", palette=p), file=err, flush=True)
             # Skip exit-condition eval on force-push tick. Just check timeout.
             if timeout > 0 and (clk.now() - start_time) > timeout:
                 return _timeout_summary(state, ignore_rules, palette=p)
@@ -146,7 +189,9 @@ def run_watch(
 
         decision = _evaluate_exit(
             state, ignore_rules=ignore_rules, now=clk.now(),
-            stalled_timeout=stalled_timeout, timed_out=False,
+            stalled_timeout=stalled_timeout,
+            awaiting_checks_since=head_since if registers_late else None,
+            timed_out=False,
             palette=p,
         )
         if decision is not None:
@@ -154,6 +199,42 @@ def run_watch(
 
 
 # Helpers =====
+
+
+def _pr_lag(meta: dict | None, pr_sha: str | None) -> tuple[str | None, str] | None:
+    """(PR head, branch tip) while the PR has not caught up; else None.
+
+    An unknown PR head (None) counts as lagging when the branch tip is known.
+    """
+    tip = (meta or {}).get("branchTipOid")
+    if tip is None or pr_sha == tip:
+        return None
+    return pr_sha, tip
+
+
+def _print_lag(lag: tuple[str | None, str], *, palette: Palette, err: TextIO) -> None:
+    line = format_pr_lag_line(when=datetime.now(), pr_sha=lag[0] or "?", branch_sha=lag[1],
+                              palette=palette)
+    print(line, file=err, flush=True)
+
+
+_HOLD = "hold"
+
+
+def _current_conflict(pr_meta: dict, meta: dict | None) -> ConflictOutcome | str | None:
+    """DIRTY or BEHIND if it holds for the branch tip; _HOLD if it may have
+    been computed for an older head; else None."""
+    outcome = assess_pr(pr_meta)
+    if outcome not in (ConflictOutcome.DIRTY, ConflictOutcome.BEHIND):
+        return None
+    tip = (meta or {}).get("branchTipOid")
+    if tip is None:
+        return outcome
+    # GitHub computed this for the head REST shows; trust it only once both APIs show the tip.
+    rest_sha = (pr_meta.get("head") or {}).get("sha")
+    if rest_sha == tip and (meta or {}).get("headRefOid") == tip:
+        return outcome
+    return _HOLD
 
 
 def _conflict_summary(
@@ -293,7 +374,7 @@ def _fetch_items(
             target.owner, target.repo, target.run_id,
             workflow_name=run.get("name"), host=host, gh_get=gh_get,
         )
-        return items, None
+        return items or [run_placeholder(run)], None
     if isinstance(target, JobTarget):
         item = fetch_job(
             target.owner, target.repo, target.job_id,
@@ -301,19 +382,20 @@ def _fetch_items(
         )
         return [item], None
     assert isinstance(target, WorkflowTarget)
-    # Raises EmptyTargetError if the workflow has no runs on the branch —
-    # caught at the cli.py main() entry to produce exit 2 with a clear
-    # message rather than silently returning [] (which downstream would
-    # misclassify as "no productive CI ran").
-    run = fetch_workflow_latest_run_or_raise(
+    # The newest run may predate the push; watch the branch tip's run. The tip
+    # doubles as head SHA so a mid-watch push re-baselines.
+    tip, run = fetch_workflow_tip_run(
         target.owner, target.repo, target.workflow_path,
         branch=target.branch, host=host, gh_get=gh_get,
     )
+    meta = {"headRefOid": tip}
+    if run is None:
+        return [], meta
     items = fetch_run_jobs(
         target.owner, target.repo, run["id"],
         workflow_name=run.get("name"), host=host, gh_get=gh_get,
     )
-    return items, None
+    return items or [run_placeholder(run)], meta
 
 
 def _evaluate_exit(
@@ -322,10 +404,15 @@ def _evaluate_exit(
     ignore_rules: list[IgnoreRule],
     now: float,
     stalled_timeout: float | None,
+    awaiting_checks_since: float | None,
     timed_out: bool,
     palette: Palette | None = None,
 ) -> tuple[int, str] | None:
-    """Returns (code, summary) if an exit condition fires; else None."""
+    """Returns (code, summary) if an exit condition fires; else None.
+
+    `awaiting_checks_since`: when the head was first watched, or None if no
+    checks can register late.
+    """
     p = ensure_palette(palette)
     items = list(state.items_by_key.values())
     ignored = [it for it in items if ignore_matches(it, ignore_rules)]
@@ -336,9 +423,9 @@ def _evaluate_exit(
     if failed:
         first = failed[0]
         result_line = (
-            f'Result: red CI (job "{first.name}" {first.conclusion})\n'
+            f'Result: red CI ({ignore_prefix(first)} "{first.name}" {first.conclusion})\n'
             f'To continue watching despite this failure: '
-            f'gh-ci watch <target> --ignore job:"{first.name}"'
+            f'gh-ci watch <target> --ignore {ignore_arg(first)}'
         )
         # S5: surface still-in-flight non-ignored jobs when bailing on red so
         # the agent knows what was running when we exited.
@@ -371,6 +458,19 @@ def _evaluate_exit(
 
     # 3. All done?
     in_flight = [it for it in active if it.status != "completed"]
+    if not active and awaiting_checks_since is not None:
+        if stalled_timeout is None or now - awaiting_checks_since <= stalled_timeout:
+            return None
+        sha = f" for {state.head_sha[:7]}" if state.head_sha else ""
+        what = "Only ignored checks" if items else "No checks"
+        return 4, format_summary(
+            items, ignored,
+            result_line=(
+                f"Result: no productive CI ran\n"
+                f"{what} registered{sha} within {stalled_timeout:.0f}s."
+            ),
+            result_style=_ResultStyle.RED, palette=p,
+        )
     if not in_flight:
         passes = [it for it in active if classify_conclusion(it.conclusion) == Outcome.PASSED]
         if passes:
